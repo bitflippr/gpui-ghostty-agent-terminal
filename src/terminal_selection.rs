@@ -134,6 +134,8 @@ mod tests {
             }
         }
         TerminalSnapshot {
+            images: Vec::new(),
+            downloads: Vec::new(),
             revision: 1,
             lifecycle: TerminalLifecycle::Running,
             active_work: false,

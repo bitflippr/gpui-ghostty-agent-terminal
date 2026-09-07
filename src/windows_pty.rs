@@ -493,8 +493,10 @@ impl PtySession {
         arguments: &[OsString],
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         allow_ctrl_c_in_children();
-        let input = Pipe::create()?;
-        let output = Pipe::create()?;
+        let input = Pipe::create(0)?;
+        // A large image transfer must not refill the default small pipe once
+        // per reader polling interval. Keep enough output buffered for bursts.
+        let output = Pipe::create(256 * 1024)?;
         let api = ConptyApi::global()?;
         let mut pseudoconsole: HPCON = 0;
         let result = unsafe {
@@ -785,7 +787,7 @@ impl PtySize {
 }
 
 impl Pipe {
-    fn create() -> Result<Self, String> {
+    fn create(buffer_bytes: u32) -> Result<Self, String> {
         let mut read = INVALID_HANDLE_VALUE;
         let mut write = INVALID_HANDLE_VALUE;
         let attributes = SECURITY_ATTRIBUTES {
@@ -793,7 +795,7 @@ impl Pipe {
             lpSecurityDescriptor: null_mut(),
             bInheritHandle: 0,
         };
-        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+        if unsafe { CreatePipe(&mut read, &mut write, &attributes, buffer_bytes) } == 0 {
             return Err(last_error("create ConPTY pipe"));
         }
         Ok(Self {

@@ -133,12 +133,16 @@ dependencies = [
 name = "agent-terminal"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "cc",
  "ctrlc",
+ "dirs",
  "fancy-regex",
+ "flate2",
  "flume",
  "gpui",
  "gpui_platform",
+ "image",
  "interprocess",
  "ksni",
  "libc",

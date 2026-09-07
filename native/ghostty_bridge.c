@@ -22,9 +22,141 @@ struct SpikeTerminal {
   size_t pty_response_len;
   size_t pty_response_capacity;
   bool pty_response_failed;
+  void* download_context;
+  SpikeDownloadCallback download_callback;
+  GhosttySizeReportSize geometry;
 };
 
 static bool success(GhosttyResult result) { return result == GHOSTTY_SUCCESS; }
+
+static bool report_size(GhosttyTerminal terminal, void* userdata, GhosttySizeReportSize* out) {
+  (void)terminal;
+  SpikeTerminal* spike = userdata;
+  if (!spike || !out || !spike->geometry.cell_width || !spike->geometry.cell_height) return false;
+  *out = spike->geometry;
+  return true;
+}
+
+extern bool agent_decode_png(void*, const GhosttyAllocator*, const uint8_t*,
+                             size_t, GhosttySysImage*);
+extern bool agent_decode_image(void*, const GhosttyAllocator*, const uint8_t*,
+                               size_t, GhosttySysAnimation*);
+
+int spike_terminal_tick_images(SpikeTerminal* spike, uint64_t now_ms, bool* changed) {
+  return ghostty_kitty_graphics_tick(spike->terminal, now_ms, changed);
+}
+
+void spike_images_init(void) {
+  ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void*)agent_decode_png);
+  ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_IMAGE, (const void*)agent_decode_image);
+}
+
+int spike_terminal_image_media(SpikeTerminal* spike, const uint8_t* directory, size_t len) {
+  const bool enabled = true;
+  const GhosttyString temp = {.ptr = directory, .len = len};
+  GhosttyResult result = ghostty_terminal_set(spike->terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE, &enabled);
+  if (result != GHOSTTY_SUCCESS) return result;
+  result = ghostty_terminal_set(spike->terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &enabled);
+  if (result != GHOSTTY_SUCCESS) return result;
+  return ghostty_terminal_set(spike->terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, &temp);
+}
+
+typedef struct {
+  GhosttyKittyGraphics graphics;
+  void* context;
+  SpikeImageCallback callback;
+} VirtualImageContext;
+
+static void visit_virtual_image(void* context, uint32_t id,
+    const GhosttyKittyGraphicsPlacementRenderInfo* info, uint32_t offset_x, uint32_t offset_y) {
+  VirtualImageContext* ctx = context;
+  GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(ctx->graphics, id);
+  if (!image) return;
+  SpikeImage out = {0};
+  out.id = id;
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &out.generation);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &out.width);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &out.height);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &out.format);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &out.pixels);
+  ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &out.pixels_len);
+  out.col = info->viewport_col;
+  out.row = info->viewport_row;
+  out.z = -1;
+  out.offset_x = offset_x;
+  out.offset_y = offset_y;
+  out.display_width = info->pixel_width;
+  out.display_height = info->pixel_height;
+  out.source_x = info->source_x;
+  out.source_y = info->source_y;
+  out.source_width = info->source_width;
+  out.source_height = info->source_height;
+  ctx->callback(ctx->context, &out);
+}
+
+int spike_terminal_images(SpikeTerminal* spike, void* context, SpikeImageCallback callback) {
+  GhosttyKittyGraphics graphics = NULL;
+  GhosttyResult result = ghostty_terminal_get(spike->terminal,
+      GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics);
+  if (result != GHOSTTY_SUCCESS) return result;
+  GhosttyKittyGraphicsPlacementIterator iter = NULL;
+  result = ghostty_kitty_graphics_placement_iterator_new(NULL, &iter);
+  if (result != GHOSTTY_SUCCESS) return result;
+  result = ghostty_kitty_graphics_get(graphics,
+      GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR, &iter);
+  if (result != GHOSTTY_SUCCESS) goto done;
+  while (ghostty_kitty_graphics_placement_next(iter)) {
+    uint32_t id = 0;
+    SpikeImage out = {0};
+    GhosttyKittyGraphicsPlacementRenderInfo info = GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsPlacementRenderInfo);
+    ghostty_kitty_graphics_placement_get(iter, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &id);
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, id);
+    if (!image) continue;
+    out.id = id;
+    result = ghostty_kitty_graphics_placement_render_info(iter, image, spike->terminal, &info);
+    if (result != GHOSTTY_SUCCESS) goto done;
+    if (!info.viewport_visible) continue;
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &out.generation);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &out.width);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &out.height);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &out.format);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &out.pixels);
+    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &out.pixels_len);
+    ghostty_kitty_graphics_placement_get(iter, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &out.z);
+    ghostty_kitty_graphics_placement_get(iter, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_X_OFFSET, &out.offset_x);
+    ghostty_kitty_graphics_placement_get(iter, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET, &out.offset_y);
+    out.col = info.viewport_col;
+    out.row = info.viewport_row;
+    out.display_width = info.pixel_width;
+    out.display_height = info.pixel_height;
+    out.source_x = info.source_x;
+    out.source_y = info.source_y;
+    out.source_width = info.source_width;
+    out.source_height = info.source_height;
+    callback(context, &out);
+  }
+done:
+  ghostty_kitty_graphics_placement_iterator_free(iter);
+  if (result == GHOSTTY_SUCCESS) {
+    VirtualImageContext ctx = {graphics, context, callback};
+    result = ghostty_kitty_graphics_visit_virtual(spike->terminal, &ctx, visit_virtual_image);
+  }
+  return result;
+}
+
+static void file_download(GhosttyTerminal terminal, void* userdata,
+                          GhosttyString name, GhosttyString data) {
+  (void)terminal;
+  SpikeTerminal* spike = userdata;
+  if (spike && spike->download_callback)
+    spike->download_callback(spike->download_context, name.ptr, name.len, data.ptr, data.len);
+}
+
+int spike_terminal_download_handler(SpikeTerminal* spike, void* context, SpikeDownloadCallback callback) {
+  spike->download_context = context;
+  spike->download_callback = callback;
+  return ghostty_terminal_set(spike->terminal, GHOSTTY_TERMINAL_OPT_FILE_DOWNLOAD, (const void*)file_download);
+}
 
 static void write_pty(GhosttyTerminal terminal, void* userdata,
                       const uint8_t* data, size_t len) {
@@ -75,6 +207,7 @@ static int finish_pty_response(SpikeTerminal* spike, const uint8_t** response,
 }
 
 SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollback) {
+  const uint64_t image_limit = 256 * 1024 * 1024;
   SpikeTerminal* spike = calloc(1, sizeof(SpikeTerminal));
   if (spike == NULL) return NULL;
 
@@ -85,7 +218,11 @@ SpikeTerminal* spike_terminal_new(uint16_t cols, uint16_t rows, size_t scrollbac
   };
   if (!success(ghostty_terminal_new(NULL, &spike->terminal, options)) ||
       !success(ghostty_terminal_set(spike->terminal,
+                                    GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &image_limit)) ||
+      !success(ghostty_terminal_set(spike->terminal,
                                     GHOSTTY_TERMINAL_OPT_USERDATA, spike)) ||
+      !success(ghostty_terminal_set(spike->terminal,
+                                    GHOSTTY_TERMINAL_OPT_SIZE, (const void*)report_size)) ||
       !success(ghostty_terminal_set(spike->terminal,
                                     GHOSTTY_TERMINAL_OPT_WRITE_PTY,
                                     (const void*)write_pty)) ||
@@ -154,9 +291,11 @@ int spike_terminal_resize(SpikeTerminal* spike, uint16_t cols, uint16_t rows,
     return GHOSTTY_INVALID_VALUE;
   }
   begin_pty_response(spike);
+  GhosttySizeReportSize previous = spike->geometry;
+  spike->geometry = (GhosttySizeReportSize){rows, cols, cell_width_px, cell_height_px};
   GhosttyResult result = ghostty_terminal_resize(
       spike->terminal, cols, rows, cell_width_px, cell_height_px);
-  if (!success(result)) return result;
+  if (!success(result)) { spike->geometry = previous; return result; }
   return finish_pty_response(spike, response, response_len);
 }
 

@@ -1,0 +1,86 @@
+# Terminal images and downloads
+
+Kitty graphics and iTerm2 image transfers are handled inside libghostty-vt.
+Terminal Session snapshots carry owned pixels and resolved placements to GPUI;
+PTY output is never filtered or rewritten before the VT engine consumes it.
+
+## Protocol coverage
+
+Kitty supports RGB, RGBA and PNG, zlib compression, chunked transfers, queries,
+image IDs and numbers, quiet replies, direct data, regular files, temporary
+files and shared memory. Placements support cropping, scaling, cell offsets,
+z ordering, cursor movement, Unicode placeholders and relative parents.
+Animation supports frame transfers and edits, composition, playback timing,
+looping and frame deletion. Image replacement removes previous placements.
+
+iTerm2 supports `File` and `MultipartFile`/`FilePart`/`FileEnd`, BEL and ST
+terminators, cell/pixel/percentage/automatic dimensions, aspect preservation,
+and feature reporting. PNG, JPEG, GIF, APNG, WebP, BMP and TIFF decoding is
+available; GIF, APNG and WebP animation retains frame timing and composition.
+PDF, PICT and other macOS-specific image formats are not implemented.
+
+Transfers with `inline=0` (the default) save files to Downloads. Names are
+reduced to safe basenames, existing files are never overwritten, and the
+terminal shows saving, completion or failure status. A bounded disk worker
+keeps disk writes off the PTY reader. Completed files can be revealed in their
+folder; receiving a file never runs it.
+
+The implementation is bounded: 256 MiB of decoded image storage per screen,
+at most 4,096 animation frames, and 64 MiB per decoded raster frame or iTerm2
+file. These limits can reject otherwise valid oversized transfers.
+
+## Rendering and lifetime
+
+The VT engine owns placement anchors, scrollback, alternate-screen state,
+relative-placement lifetime and animation clocks. Resizing updates the VT
+engine and PTY transport with the same physical cell metrics. Standard terminal
+size queries report those metrics to image clients.
+
+GPUI clips placements to the viewport, draws images in Kitty's three z layers,
+and paints the cursor last. Image generations share textures across placements;
+retired textures are explicitly removed from the window atlas. Replicated edge
+pixels prevent atlas padding from bleeding into enlarged images.
+
+Windows output pipes buffer large bursts so image transfers do not wait for a
+reader polling interval after each small pipe refill. Optimized development
+builds use Zig `ReleaseSafe`; unoptimized tests retain Zig `Debug`.
+
+## Validation and reproduction
+
+Run `python scripts/terminal-images-demo.py` in the terminal for a visual
+fixture covering RGBA, transparency, cropping, iTerm2 PNG and Kitty animation.
+
+Automated checks:
+
+```text
+cargo test --lib terminal_image::tests
+cargo test --lib terminal_download::tests
+cargo test --lib terminal_session::tests
+```
+
+Manual timing and client tests require local inputs. Set
+`IMAGE_PROTOCOL_TEST_FILE` to an image and run
+`cargo test --profile dev --lib profile_image_protocol_input -- --ignored --nocapture`.
+On Windows, set `IMAGE_PROTOCOL_TEST_COMMAND` to a command that emits an
+animation and run
+`cargo test --profile dev --lib animated_image_client_round_trips_through_conpty -- --ignored --nocapture`.
+The latter verifies changing pixels through a real ConPTY session for seven
+seconds. It does not assert timing thresholds or modify client configuration.
+
+Windows visual validation includes alpha, cropped placements, scaled single
+pixels, and a 498-by-498 animated GIF with 159 frames through an image client.
+Client layout must account for cursor movement and scrolling caused by iTerm2
+image output; restoring an old absolute screen row after a scroll is incorrect.
+macOS/Linux runtime validation and non-raster format coverage remain open.
+
+## Upstream extension
+
+The pinned Ghostty submodule remains unchanged. The build applies
+`vendor/ghostty-patches/terminal-images.patch` to a build-owned checkout; see
+[the patch workflow](../vendor/ghostty-patches/README.md). External libghostty
+libraries and headers must contain the same extensions if build overrides are
+used.
+
+Specifications: [Kitty graphics](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
+[iTerm2 images and file transfers](https://iterm2.com/documentation-images.html),
+[iTerm2 feature reporting](https://iterm2.com/feature-reporting/).
