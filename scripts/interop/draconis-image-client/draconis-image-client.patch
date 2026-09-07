@@ -1,0 +1,383 @@
+diff --git a/core/src/CLI/UI/UI.cpp b/core/src/CLI/UI/UI.cpp
+index 096403e..48406e7 100644
+--- a/core/src/CLI/UI/UI.cpp
++++ b/core/src/CLI/UI/UI.cpp
+@@ -3,11 +3,18 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <cmath>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <iostream>
+ #include <sstream>
+-#ifndef _WIN32
++#if defined(_WIN32) && DRAC_ARCH_X86_64 && defined(__clang__)
++  #include <immintrin.h>
++  #include <intrin.h>
++#endif
++#ifdef _WIN32
++  #include <windows.h>
++#else
+   #include <sys/ioctl.h> // TIOCGWINSZ
+   #include <unistd.h>    // STDOUT_FILENO
+ #endif
+@@ -141,6 +148,7 @@ namespace draconis::ui {
+     struct LogoRender {
+       Vec<String> lines;    // ASCII art lines when using ascii logos
+       String      sequence; // Escape sequence when using inline image logos
++      Vec<u8>     streamedBytes;
+       usize       width    = 0;
+       usize       height   = 0;
+       bool        isInline = false;
+@@ -214,42 +222,79 @@ namespace draconis::ui {
+       '\0'
+     };
+ 
+-    auto Base64Encode(Span<const u8> data) -> String {
+-      String out;
+-      out.reserve(((data.size() + 2) / 3) * 4);
+-
+-      usize idx = 0;
++#if defined(_WIN32) && DRAC_ARCH_X86_64 && defined(__clang__)
++    __attribute__((target("xsave"))) auto HasAvxState() -> bool {
++      return (_xgetbv(0) & 6) == 6;
++    }
+ 
+-      while (idx + 2 < data.size()) {
+-        const u32 triple = (static_cast<u32>(data.subspan(idx).front()) << 16) |
+-          (static_cast<u32>(data.subspan(idx + 1).front()) << 8) |
+-          static_cast<u32>(data.subspan(idx + 2).front());
++    auto HasAvx2() -> bool {
++      int registers[4];
++      __cpuid(registers, 0);
++      if (registers[0] < 7)
++        return false;
++      __cpuid(registers, 1);
++      // The CPU and operating system must both support saving AVX registers.
++      if ((registers[2] & 0x18000000) != 0x18000000 || !HasAvxState())
++        return false;
++      __cpuidex(registers, 7, 0);
++      return (registers[1] & 0x20) != 0;
++    }
+ 
+-        out.push_back(BASE64_TABLE.at((triple >> 18) & 0x3F));
+-        out.push_back(BASE64_TABLE.at((triple >> 12) & 0x3F));
+-        out.push_back(BASE64_TABLE.at((triple >> 6) & 0x3F));
+-        out.push_back(BASE64_TABLE.at(triple & 0x3F));
++    __attribute__((target("avx2"))) auto Base64EncodeAvx2(const u8* data, usize size, char* out) -> usize {
++      const auto shuffle  = _mm256_setr_epi8(1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10, 1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10);
++      const auto offsets  = _mm256_setr_epi8(65, 71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 0, 0, 65, 71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 0, 0);
++      usize      consumed = 0;
++      // Each lane consumes 12 bytes. The extra four loaded bytes stay inside the input.
++      while (size - consumed >= 28) {
++        auto input         = _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + consumed)));
++        input              = _mm256_inserti128_si256(input, _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + consumed + 12)), 1);
++        input              = _mm256_shuffle_epi8(input, shuffle);
++        const auto high    = _mm256_mulhi_epu16(_mm256_and_si256(input, _mm256_set1_epi32(0x0fc0fc00)), _mm256_set1_epi32(0x04000040));
++        const auto low     = _mm256_mullo_epi16(_mm256_and_si256(input, _mm256_set1_epi32(0x003f03f0)), _mm256_set1_epi32(0x01000010));
++        const auto sextets = _mm256_or_si256(high, low);
++        const auto indices = _mm256_sub_epi8(_mm256_subs_epu8(sextets, _mm256_set1_epi8(51)), _mm256_cmpgt_epi8(sextets, _mm256_set1_epi8(25)));
++        const auto encoded = _mm256_add_epi8(sextets, _mm256_shuffle_epi8(offsets, indices));
++        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + consumed / 3 * 4), encoded);
++        consumed += 24;
++      }
++      return consumed;
++    }
++#endif
+ 
++    auto Base64EncodeInto(Span<const u8> data, char* out) -> void {
++      usize idx = 0;
++#if defined(_WIN32) && DRAC_ARCH_X86_64 && defined(__clang__)
++      static const bool useAvx2 = HasAvx2();
++      if (useAvx2)
++        idx = Base64EncodeAvx2(data.data(), data.size(), out);
++#endif
++      usize dest = idx / 3 * 4;
++      while (data.size() - idx >= 3) {
++        const u32 triple = (static_cast<u32>(data[idx]) << 16) |
++          (static_cast<u32>(data[idx + 1]) << 8) | static_cast<u32>(data[idx + 2]);
++        out[dest++] = BASE64_TABLE[(triple >> 18) & 0x3f];
++        out[dest++] = BASE64_TABLE[(triple >> 12) & 0x3f];
++        out[dest++] = BASE64_TABLE[(triple >> 6) & 0x3f];
++        out[dest++] = BASE64_TABLE[triple & 0x3f];
+         idx += 3;
+       }
+-
+-      const usize remaining = data.size() - idx;
+-
+-      if (remaining == 1) {
+-        const u32 triple = static_cast<u32>(data.subspan(idx).front()) << 16;
+-        out.push_back(BASE64_TABLE.at((triple >> 18) & 0x3F));
+-        out.push_back(BASE64_TABLE.at((triple >> 12) & 0x3F));
+-        out.push_back('=');
+-        out.push_back('=');
+-      } else if (remaining == 2) {
+-        const u32 triple = (static_cast<u32>(data.subspan(idx).front()) << 16) |
+-          (static_cast<u32>(data.subspan(idx + 1).front()) << 8);
+-        out.push_back(BASE64_TABLE.at((triple >> 18) & 0x3F));
+-        out.push_back(BASE64_TABLE.at((triple >> 12) & 0x3F));
+-        out.push_back(BASE64_TABLE.at((triple >> 6) & 0x3F));
+-        out.push_back('=');
++      if (idx < data.size()) {
++        const bool twoBytes = data.size() - idx == 2;
++        const u32  triple   = (static_cast<u32>(data[idx]) << 16) |
++          (twoBytes ? static_cast<u32>(data[idx + 1]) << 8 : 0);
++        out[dest++] = BASE64_TABLE[(triple >> 18) & 0x3f];
++        out[dest++] = BASE64_TABLE[(triple >> 12) & 0x3f];
++        out[dest++] = twoBytes ? BASE64_TABLE[(triple >> 6) & 0x3f] : '=';
++        out[dest]   = '=';
+       }
++    }
+ 
++    auto Base64Encode(Span<const u8> data) -> String {
++      String out;
++      out.resize_and_overwrite(((data.size() + 2) / 3) * 4, [&](char* dest, usize size) {
++        Base64EncodeInto(data, dest);
++        return size;
++      });
+       return out;
+     }
+ 
+@@ -258,6 +303,82 @@ namespace draconis::ui {
+       return Base64Encode(Span<const u8>(reinterpret_cast<const u8*>(bytes.data()), bytes.size())); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+     }
+ 
++    class InlineWriter {
++      static constexpr usize CHUNK_SIZE = 65536;
++#ifdef _WIN32
++      HANDLE     m_output;
++      bool       m_wide = false;
++      Vec<WCHAR> m_widened;
++#endif
++
++     public:
++      InlineWriter() {
++#ifdef _WIN32
++        // Preserve ordering with cursor controls buffered in std::cout.
++        std::cout.flush();
++        m_output          = GetStdHandle(STD_OUTPUT_HANDLE);
++        DWORD consoleMode = 0;
++        m_wide            = GetConsoleMode(m_output, &consoleMode);
++        if (m_wide)
++          m_widened.resize(CHUNK_SIZE);
++#endif
++      }
++
++      auto write(StringView sequence) -> void {
++#ifdef _WIN32
++        usize offset = 0;
++        while (offset < sequence.size() && std::cout.good()) {
++          const DWORD count   = static_cast<DWORD>(std::min(CHUNK_SIZE, sequence.size() - offset));
++          DWORD       written = 0;
++          BOOL        ok;
++          if (m_wide) {
++            // Inline protocol headers and base64 data are all ASCII.
++            for (usize i = 0; i < count; ++i)
++              m_widened[i] = static_cast<unsigned char>(sequence[offset + i]);
++            ok = WriteConsoleW(m_output, m_widened.data(), count, &written, nullptr);
++          } else {
++            ok = WriteFile(m_output, sequence.data() + offset, count, &written, nullptr);
++          }
++          if (!ok || written == 0) {
++            std::cout.setstate(std::ios::badbit);
++            return;
++          }
++          offset += written;
++        }
++#else
++        std::cout << sequence;
++#endif
++      }
++
++      static constexpr auto chunkSize() -> usize {
++        return CHUNK_SIZE;
++      }
++    };
++
++    auto WriteInlineSequence(StringView sequence, Span<const u8> streamedBytes) -> void {
++      InlineWriter writer;
++      writer.write(sequence);
++      if (streamedBytes.empty())
++        return;
++      constexpr StringView partHeader = "\033]1337;FilePart=";
++      // Include framing in the write limit and split input on complete base64 triples.
++      constexpr usize payloadSize    = ((InlineWriter::chunkSize() - partHeader.size() - 1) / 4) * 4;
++      constexpr usize inputChunkSize = payloadSize / 4 * 3;
++      String          part;
++      part.reserve(payloadSize + partHeader.size() + 1);
++      for (usize offset = 0; offset < streamedBytes.size() && std::cout.good(); offset += inputChunkSize) {
++        const auto chunk = streamedBytes.subspan(offset, std::min(inputChunkSize, streamedBytes.size() - offset));
++        part.resize_and_overwrite(((chunk.size() + 2) / 3) * 4 + partHeader.size() + 1, [&](char* dest, usize size) {
++          std::memcpy(dest, partHeader.data(), partHeader.size());
++          Base64EncodeInto(chunk, dest + partHeader.size());
++          dest[size - 1] = '\a';
++          return size;
++        });
++        writer.write(part);
++      }
++      writer.write("\033]1337;FileEnd\a");
++    }
++
+     auto ReadFileBytes(const String& path) -> Option<Vec<u8>> {
+       std::ifstream file(path, std::ios::binary);
+ 
+@@ -288,7 +409,34 @@ namespace draconis::ui {
+ 
+     // Query terminal cell pixel dimensions (stdout). Returns None if unavailable.
+     auto GetCellMetricsPx() -> Option<Pair<double, double>> {
+-#ifndef _WIN32
++#ifdef _WIN32
++      HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
++      DWORD  mode  = 0;
++      if (!GetConsoleMode(input, &mode) || !SetConsoleMode(input, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)))
++        return None;
++      std::cout << "\033[16t" << std::flush;
++      String          response;
++      const ULONGLONG deadline = GetTickCount64() + 500;
++      while (GetTickCount64() < deadline && response.size() < 64) {
++        if (WaitForSingleObject(input, 20) != WAIT_OBJECT_0)
++          continue;
++        INPUT_RECORD record {};
++        DWORD        count = 0;
++        if (!ReadConsoleInputW(input, &record, 1, &count))
++          break;
++        if (count && record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
++          const WCHAR c = record.Event.KeyEvent.uChar.UnicodeChar;
++          if (c > 0 && c < 128)
++            response += static_cast<char>(c);
++          if (c == L't')
++            break;
++        }
++      }
++      SetConsoleMode(input, mode);
++      unsigned height = 0, width = 0;
++      if (std::sscanf(response.c_str(), "\033[6;%u;%ut", &height, &width) == 2 && width > 0 && height > 0)
++        return Pair<double, double> { width, height };
++#else
+       winsize ws {};
+       if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+         if (ws.ws_col > 0 && ws.ws_row > 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0) {
+@@ -304,8 +452,9 @@ namespace draconis::ui {
+     // Detect if the terminal supports inline image rendering (Kitty/iTerm2 protocols).
+     auto SupportsInlineImages([[maybe_unused]] LogoProtocol protocol) -> bool {
+ #ifdef _WIN32
+-      // Windows terminals generally don't support inline images via these protocols
+-      return false;
++      // Temporary integration-test override for a terminal with image support.
++      const char* override = std::getenv("DRAC_TEST_INLINE_IMAGES");
++      return override != nullptr && StringView(override) == "1";
+ #else
+       // Must be a TTY to render images
+       if (isatty(STDOUT_FILENO) == 0)
+@@ -369,6 +518,10 @@ namespace draconis::ui {
+       if (readCount < 24)
+         return None;
+ 
++      if (header.at(0) == 'G' && header.at(1) == 'I' && header.at(2) == 'F')
++        return ImageSize { .width  = static_cast<usize>(header.at(6)) | (static_cast<usize>(header.at(7)) << 8),
++                           .height = static_cast<usize>(header.at(8)) | (static_cast<usize>(header.at(9)) << 8) };
++
+       // PNG signature
+       const Array<u8, 8> pngSig { 137, 80, 78, 71, 13, 10, 26, 10 };
+       if (std::equal(pngSig.begin(), pngSig.end(), header.begin())) {
+@@ -431,7 +584,7 @@ namespace draconis::ui {
+       return None;
+     }
+ 
+-    auto BuildInlineSequence(const config::Logo& logoCfg, usize widthCells, usize heightCells, usize widthPx, usize heightPx) -> Option<String> {
++    auto BuildInlineSequence(const config::Logo& logoCfg, usize widthCells, usize heightCells, usize widthPx, usize heightPx, Vec<u8>& streamedBytes) -> Option<String> {
+       if (!logoCfg.imagePath)
+         return None;
+ 
+@@ -461,7 +614,7 @@ namespace draconis::ui {
+         return sequence;
+       }
+ 
+-      const Option<Vec<u8>> bytes = ReadFileBytes(*logoCfg.imagePath);
++      Option<Vec<u8>> bytes = ReadFileBytes(*logoCfg.imagePath);
+ 
+       if (!bytes || bytes->empty())
+         return None;
+@@ -475,9 +628,7 @@ namespace draconis::ui {
+       };
+ 
+       if (protocol == LogoProtocol::Iterm2) {
+-        const String payload = Base64Encode(Span<const u8>(*bytes));
+-
+-        sequence = "\033]1337;File=inline=1";
++        sequence = "\033]1337;MultipartFile=inline=1";
+         sequence += std::format(";size={}", bytes->size());
+ 
+         const std::filesystem::path filePath(*logoCfg.imagePath);
+@@ -491,10 +642,8 @@ namespace draconis::ui {
+           sequence += std::format(";height={}", *heightArg);
+ 
+         sequence += ";preserveAspectRatio=1";
+-        sequence += ":";
+-        sequence += payload;
+         sequence += "\a";
+-
++        streamedBytes = std::move(*bytes);
+         return sequence;
+       }
+ 
+@@ -597,12 +746,12 @@ namespace draconis::ui {
+       if (shiftWidthCells == 0)
+         shiftWidthCells = 24; // minimal gap to avoid overlap when sizing is unknown
+ 
+-      const Option<String> sequence = BuildInlineSequence(logoCfg, sendWidthCells, sendHeightCells, sendWidthPx, sendHeightPx);
++      LogoRender     render;
++      Option<String> sequence = BuildInlineSequence(logoCfg, sendWidthCells, sendHeightCells, sendWidthPx, sendHeightPx, render.streamedBytes);
+ 
+       if (!sequence)
+         return None;
+ 
+-      LogoRender render;
+       // width/height reported back are used for shifting/padding the text box; ensure
+       // height reflects any sizing we applied (cells or derived pixels).
+ 
+@@ -619,7 +768,7 @@ namespace draconis::ui {
+                 )
+           );
+       render.isInline = true;
+-      render.sequence = *sequence;
++      render.sequence = std::move(*sequence);
+ 
+       return render;
+     }
+@@ -1478,15 +1627,17 @@ namespace draconis::ui {
+     usize       maxLogoW      = 0;
+     usize       logoHeightOpt = 0;
+     String      inlineSequence;
++    Vec<u8>     streamedBytes;
+     bool        isInlineLogo = false;
+ 
+     if (!noAscii) {
+-      if (const Option<LogoRender> inlineLogo = BuildInlineLogo(config.logo, boxLines.size())) {
++      if (Option<LogoRender> inlineLogo = BuildInlineLogo(config.logo, boxLines.size())) {
+         logoLines      = inlineLogo->lines;
+         maxLogoW       = inlineLogo->width;
+         logoHeightOpt  = inlineLogo->height;
+         isInlineLogo   = inlineLogo->isInline;
+-        inlineSequence = inlineLogo->sequence;
++        inlineSequence = std::move(inlineLogo->sequence);
++        streamedBytes  = std::move(inlineLogo->streamedBytes);
+       }
+ 
+       if (!isInlineLogo && logoLines.empty()) {
+@@ -1521,10 +1672,13 @@ namespace draconis::ui {
+                   boxPadTop   = (totalHeight > boxLines.size()) ? (totalHeight - boxLines.size()) / 2 : 0;
+ 
+       if (!inlineSequence.empty()) {
++        // Reserve vertical space before saving a screen-relative cursor.
++        // iTerm2 image output advances the cursor and may otherwise scroll it.
++        std::cout << String(totalHeight, '\n') << std::format("\033[{}A\r", totalHeight);
+         std::cout << "\033[s"; // save cursor
+         if (logoPadTop > 0)
+           std::cout << std::format("\033[{}B", logoPadTop); // move down to vertically center logo
+-        std::cout << inlineSequence;
++        WriteInlineSequence(inlineSequence, streamedBytes);
+         if (logoPadTop > 0)
+           std::cout << std::format("\033[{}A", logoPadTop); // move back up
+         std::cout << "\033[u" << std::flush;                // restore cursor

@@ -1386,6 +1386,92 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires IMAGE_PROTOCOL_BENCH_VARIANTS pointing to a JSON command list"]
+    fn compare_image_client_startup_through_conpty() {
+        #[derive(serde::Deserialize)]
+        struct Variant {
+            label: String,
+            command: String,
+            expect_image: bool,
+        }
+        let path = std::env::var("IMAGE_PROTOCOL_BENCH_VARIANTS").expect("set benchmark JSON path");
+        let variants: Vec<Variant> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!variants.is_empty());
+        let rounds = std::env::var("IMAGE_PROTOCOL_BENCH_ROUNDS")
+            .map(|value| value.parse::<usize>().expect("positive round count"))
+            .unwrap_or(6);
+        assert!((1..=100).contains(&rounds));
+
+        for round in 0..rounds {
+            // Rotate the first variant so warming and background load do not
+            // consistently favor one sender. Each sample has a fresh VT/PTY.
+            for offset in 0..variants.len() {
+                let variant = &variants[(round + offset) % variants.len()];
+                let startup = Instant::now();
+                let (mut session, events) =
+                    TerminalSession::spawn(TerminalSize::new(100, 80, 10, 20)).unwrap();
+                session
+                    .input(b"@echo off\r\necho IMAGE_BENCH_READY\r\n")
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let _ = events.recv_timeout(Duration::from_millis(10));
+                    let screen = snapshot_text(&session.snapshot().unwrap());
+                    if screen
+                        .lines()
+                        .any(|line| line.trim() == "IMAGE_BENCH_READY")
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "shell failed to become ready: {screen}"
+                    );
+                }
+                let ready_ms = startup.elapsed().as_secs_f64() * 1000.0;
+                let launched = Instant::now();
+                session
+                    .input(format!("{} && echo IMAGE_BENCH_DONE\r\n", variant.command).as_bytes())
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut first_image_ms = None;
+                let mut completed_ms = None;
+                loop {
+                    let _ = events.recv_timeout(Duration::from_millis(10));
+                    let snapshot = session.snapshot().unwrap();
+                    if !snapshot.images.is_empty() && first_image_ms.is_none() {
+                        first_image_ms = Some(launched.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    let screen = snapshot_text(&snapshot);
+                    if completed_ms.is_none()
+                        && screen.lines().any(|line| line.trim() == "IMAGE_BENCH_DONE")
+                    {
+                        completed_ms = Some(launched.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    if completed_ms.is_some() && (!variant.expect_image || first_image_ms.is_some())
+                    {
+                        eprintln!(
+                            "IMAGE_BENCH {}",
+                            serde_json::json!({
+                                "round": round + 1, "label": variant.label,
+                                "shell_ready_ms": ready_ms, "first_image_ms": first_image_ms,
+                                "completed_ms": completed_ms.unwrap(),
+                            })
+                        );
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} did not complete or display its expected image: {screen}",
+                        variant.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "requires IMAGE_PROTOCOL_TEST_COMMAND naming an installed image client"]
     fn animated_image_client_round_trips_through_conpty() {
         let command =

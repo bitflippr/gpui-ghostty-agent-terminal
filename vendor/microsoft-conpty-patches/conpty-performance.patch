@@ -1,0 +1,311 @@
+diff --git a/src/host/screenInfo.cpp b/src/host/screenInfo.cpp
+index 136ccc4f1f34cbc5bb41f8c6cbe46d3caf89d183..34ac236c90586c1e8314cfb5815607135c62ce15 100644
+--- a/src/host/screenInfo.cpp
++++ b/src/host/screenInfo.cpp
+@@ -251,7 +251,11 @@ void SCREEN_INFORMATION::s_RemoveScreenBuffer(_In_ SCREEN_INFORMATION* const pSc
+         // Note that at this point in the setup, we haven't determined if we're
+         //      in VtIo mode or not yet. We'll set the OutputStateMachine's
+         //      TerminalConnection later, in VtIo::StartIfNeeded
+-        _stateMachine = std::make_shared<StateMachine>(std::move(engine));
++        // OutputStateMachineEngine::ActionPassThroughString is a no-op.
++        // WriteCharsVT forwards the original stream independently, so this
++        // parser never needs a second copy of unfinished control sequences.
++        // Input and other parser clients retain sequence caching by default.
++        _stateMachine = std::make_shared<StateMachine>(std::move(engine), false, false);
+     }
+     catch (...)
+     {
+diff --git a/src/terminal/adapter/adaptDispatch.cpp b/src/terminal/adapter/adaptDispatch.cpp
+index c80c98a007d1bf27a96cc772acd6f4188bf5903d..2f6dc7f23d682599955b7b041149a13d25a0af70 100644
+--- a/src/terminal/adapter/adaptDispatch.cpp
++++ b/src/terminal/adapter/adaptDispatch.cpp
+@@ -3628,16 +3628,9 @@ void AdaptDispatch::DoITerm2Action(const std::wstring_view string)
+         return;
+     }
+ 
+-    const auto parts = Utils::SplitString(string, L';');
+-
+-    if (parts.size() < 1)
+-    {
+-        return;
+-    }
+-
+-    const auto action = til::at(parts, 0);
+-
+-    if (action == L"SetMark")
++    // SetMark is the only supported action. Compare its complete first token
++    // directly instead of scanning and allocating tokens for large image data.
++    if (string == L"SetMark" || string.starts_with(L"SetMark;"))
+     {
+         _pages.ActivePage().Buffer().StartPrompt();
+         _api.NotifyShellIntegrationMark();
+diff --git a/src/terminal/adapter/ut_adapter/adapterTest.cpp b/src/terminal/adapter/ut_adapter/adapterTest.cpp
+index 51c5ca837d4d29c89e3682eb9f0e25b3f8aea985..aaa0c2f34edef425dccffbdaf074604554772d10 100644
+--- a/src/terminal/adapter/ut_adapter/adapterTest.cpp
++++ b/src/terminal/adapter/ut_adapter/adapterTest.cpp
+@@ -215,8 +215,11 @@ public:
+     void NotifyShellIntegrationMark() override
+     {
+         Log::Comment(L"NotifyShellIntegrationMark MOCK called...");
++        ++_shellIntegrationMarks;
+     }
+ 
++    size_t _shellIntegrationMarks = 0;
++
+     void InvokeCompletions(std::wstring_view menuJson, unsigned int replaceLength) override
+     {
+         Log::Comment(L"InvokeCompletions MOCK called...");
+@@ -441,6 +444,40 @@ public:
+         return true;
+     }
+ 
++    TEST_METHOD(ITerm2SetMarkFirstToken)
++    {
++        _testGetSet->PrepData();
++        size_t expected = 0;
++        const auto check = [&](const std::wstring_view value) {
++            // Reference the original dispatch contract: the first semicolon-
++            // delimited token is exactly SetMark.
++            if (Feature_ScrollbarMarks::IsEnabled() && value.substr(0, value.find(L';')) == L"SetMark")
++            {
++                ++expected;
++            }
++            _pDispatch->DoITerm2Action(value);
++            return _testGetSet->_shellIntegrationMarks == expected;
++        };
++
++        for (const auto value : { L"", L"SetMark", L"SetMark;", L"SetMark;ignored", L"SetMarker", L";SetMark", L"setmark", L"FileEnd" })
++        {
++            VERIFY_IS_TRUE(check(value));
++        }
++        for (uint32_t codeUnit = 0; codeUnit <= 0xffff; ++codeUnit)
++        {
++            std::wstring value = L"SetMark";
++            value += static_cast<wchar_t>(codeUnit);
++            value += L";ignored";
++            if (!check(value))
++            {
++                VERIFY_FAIL(L"SetMark prefix changed the first-token dispatch contract");
++                return;
++            }
++        }
++        const auto image = std::wstring{ L"FilePart=" } + std::wstring(1024 * 1024, L'A');
++        VERIFY_IS_TRUE(check(image));
++    }
++
+     TEST_METHOD(CursorMovementTest)
+     {
+         BEGIN_TEST_METHOD_PROPERTIES()
+diff --git a/src/terminal/parser/stateMachine.cpp b/src/terminal/parser/stateMachine.cpp
+index c45e2fc2f43979d1fc042a244b34fa61ffd941ec..0015449336e1c38692d2fb525d44a7db9f8b908d 100644
+--- a/src/terminal/parser/stateMachine.cpp
++++ b/src/terminal/parser/stateMachine.cpp
+@@ -11,9 +11,10 @@
+ using namespace Microsoft::Console::VirtualTerminal;
+ 
+ //Takes ownership of the pEngine.
+-StateMachine::StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bool isEngineForInput) noexcept :
++StateMachine::StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bool isEngineForInput, const bool cacheSequences) noexcept :
+     _engine(std::move(engine)),
+     _isEngineForInput(isEngineForInput),
++    _cacheSequences(cacheSequences),
+     _state(VTStates::Ground),
+     _trace(Microsoft::Console::VirtualTerminal::ParserTracing()),
+     _parameters{},
+@@ -2018,6 +2019,29 @@ void StateMachine::ProcessString(const std::wstring_view string)
+ 
+         do
+         {
++            if (_state == VTStates::OscString)
++            {
++                // Printable OSC data does not change parser state. Reuse the
++                // vectorized control scan while retaining the scalar path for
++                // all C0/C1 controls and DEL, including sequence termination.
++#pragma warning(suppress : 26481) // Pointer arithmetic is intentional in the hot path.
++                const auto beg = string.data() + i;
++                const auto end = Microsoft::Console::Utils::FindActionableControlCharacter(beg, string.size() - i);
++                const auto count = static_cast<size_t>(end - beg);
++                if (count)
++                {
++                    const std::wstring_view run{ beg, count };
++                    _trace.TraceOscString(run);
++                    _oscString.append(run);
++                    _runSize += count;
++                    i += count;
++                    _processingLastCharacter = i >= string.size();
++                    if (_processingLastCharacter)
++                    {
++                        break;
++                    }
++                }
++            }
+             _runSize++;
+             _processingLastCharacter = i + 1 >= string.size();
+             // If we're processing characters individually, send it to the state machine.
+@@ -2030,7 +2054,7 @@ void StateMachine::ProcessString(const std::wstring_view string)
+     if (_state != VTStates::Ground)
+     {
+         const auto run = _CurrentRun();
+-        auto cacheUnusedRun = true;
++        auto cacheUnusedRun = _cacheSequences;
+ 
+         // One of the "weird things" in VT input is the case of something like
+         // <kbd>alt+[</kbd>. In VT, that's encoded as `\x1b[`. However, that's
+diff --git a/src/terminal/parser/stateMachine.hpp b/src/terminal/parser/stateMachine.hpp
+index 42756abd15d893216e55cf6b7dbaa1cb12003292..417b2b336dbabbc587325e6f46547d124df12110 100644
+--- a/src/terminal/parser/stateMachine.hpp
++++ b/src/terminal/parser/stateMachine.hpp
+@@ -68,7 +68,7 @@ namespace Microsoft::Console::VirtualTerminal
+             StateMachine(std::move(engine), std::is_same_v<T, class InputStateMachineEngine>)
+         {
+         }
+-        StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bool isEngineForInput) noexcept;
++        StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bool isEngineForInput, const bool cacheSequences = true) noexcept;
+ 
+         enum class Mode : size_t
+         {
+@@ -191,6 +191,7 @@ namespace Microsoft::Console::VirtualTerminal
+ 
+         std::unique_ptr<IStateMachineEngine> _engine;
+         const bool _isEngineForInput;
++        const bool _cacheSequences;
+ 
+         VTStates _state;
+ 
+diff --git a/src/terminal/parser/tracing.cpp b/src/terminal/parser/tracing.cpp
+index 862c9c1ed8048aae590651128fa00608ad37c720..a450ab218d4709231fd01de87cbf22df2347ed76 100644
+--- a/src/terminal/parser/tracing.cpp
++++ b/src/terminal/parser/tracing.cpp
+@@ -93,6 +93,21 @@ void ParserTracing::AddSequenceTrace(const wchar_t wch)
+     }
+ }
+ 
++void ParserTracing::TraceOscString(const std::wstring_view& string)
++{
++    // Preserve the per-character diagnostic stream without paying its cost
++    // for every code unit when no listener is attached.
++    if (TraceLoggingProviderEnabled(g_hConsoleVirtTermParserEventTraceProvider, WINEVENT_LEVEL_VERBOSE, TIL_KEYWORD_TRACE))
++    {
++        for (const auto ch : string)
++        {
++            TraceCharInput(ch);
++            TraceOnEvent(L"OscString");
++            TraceOnAction(L"OscPut");
++        }
++    }
++}
++
+ void ParserTracing::DispatchSequenceTrace(const bool fSuccess) noexcept
+ {
+     if (fSuccess)
+diff --git a/src/terminal/parser/tracing.hpp b/src/terminal/parser/tracing.hpp
+index 56e449f06fe194239ad088e4a20673b13d86a35e..366f6cd43f15d5537f90848f1d73cf95fbcbf205 100644
+--- a/src/terminal/parser/tracing.hpp
++++ b/src/terminal/parser/tracing.hpp
+@@ -42,6 +42,7 @@ namespace Microsoft::Console::VirtualTerminal
+         void TraceOnExecuteFromEscape(const wchar_t wch) const noexcept;
+         void TraceOnEvent(_In_z_ const wchar_t* name) const noexcept;
+         void TraceCharInput(const wchar_t wch);
++        void TraceOscString(const std::wstring_view& string);
+ 
+         void AddSequenceTrace(const wchar_t wch);
+         void DispatchSequenceTrace(const bool fSuccess) noexcept;
+diff --git a/src/terminal/parser/ut_parser/StateMachineTest.cpp b/src/terminal/parser/ut_parser/StateMachineTest.cpp
+index b26243e0271b4921bf22085f6004cc49e33d84bf..116b685906d2f1b2b1c6867e182754a31c2d51df 100644
+--- a/src/terminal/parser/ut_parser/StateMachineTest.cpp
++++ b/src/terminal/parser/ut_parser/StateMachineTest.cpp
+@@ -158,8 +158,94 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
+     TEST_METHOD(DcsDataStringsReceivedByHandler);
+ 
+     TEST_METHOD(VtParameterSubspanTest);
++    TEST_METHOD(OscBulkMatchesScalar);
++    TEST_METHOD(OscBulkPreservesPassthrough);
+ };
+ 
++void StateMachineTest::OscBulkMatchesScalar()
++{
++    struct OscRecordingEngine final : TestStateMachineEngine
++    {
++        std::vector<std::pair<size_t, std::wstring>> osc;
++        bool ActionPrint(const wchar_t ch) override
++        {
++            printed += ch;
++            return true;
++        }
++        bool ActionOscDispatch(const size_t parameter, const std::wstring_view value) override
++        {
++            osc.emplace_back(parameter, value);
++            return true;
++        }
++    };
++
++    for (const bool acceptC1 : { false, true })
++    {
++        auto scalarEngine = std::make_unique<OscRecordingEngine>();
++        auto bulkEngine = std::make_unique<OscRecordingEngine>();
++        auto& scalar = *scalarEngine;
++        auto& bulk = *bulkEngine;
++        StateMachine scalarMachine{ std::move(scalarEngine) };
++        StateMachine bulkMachine{ std::move(bulkEngine), false, false };
++        scalarMachine.SetParserMode(StateMachine::Mode::AcceptC1, acceptC1);
++        bulkMachine.SetParserMode(StateMachine::Mode::AcceptC1, acceptC1);
++
++        // Every UTF-16 code unit is placed between long printable runs. This
++        // covers CAN/SUB, BEL, ESC, DEL, C1, NUL, and unpaired surrogates.
++        for (uint32_t value = 0; value <= 0xffff; ++value)
++        {
++            scalar.ResetTestState();
++            bulk.ResetTestState();
++            scalar.osc.clear();
++            bulk.osc.clear();
++            scalarMachine.ResetState();
++            bulkMachine.ResetState();
++            std::wstring input = L"\x1b]1337;ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++            input += static_cast<wchar_t>(value);
++            input += L"abcdefghijklmnopqrstuvwxyz0123456789\a\x18";
++            for (const auto ch : input)
++            {
++                scalarMachine.ProcessCharacter(ch);
++            }
++            // Sweep split positions while also testing complete runs.
++            const size_t chunkSize = 1 + value % 97;
++            for (size_t offset = 0; offset < input.size(); offset += chunkSize)
++            {
++                bulkMachine.ProcessString(std::wstring_view{ input }.substr(offset, chunkSize));
++            }
++            if (scalar.printed != bulk.printed || scalar.executed != bulk.executed || scalar.osc != bulk.osc)
++            {
++                Log::Comment(String().Format(L"Differential OSC failure at U+%04X, AcceptC1=%d", value, acceptC1));
++                VERIFY_FAIL(L"Bulk OSC parsing differs from scalar parsing");
++                return;
++            }
++        }
++    }
++}
++
++void StateMachineTest::OscBulkPreservesPassthrough()
++{
++    for (const auto terminator : { std::wstring_view{ L"\a" }, std::wstring_view{ L"\x1b\\" } })
++    {
++        std::wstring input = L"\x1b]1337;FilePart=";
++        input.append(65536, L'A');
++        input += L"\x7f\x1f\x4e00";
++        input += terminator;
++        for (const size_t chunkSize : { 1u, 2u, 7u, 8u, 9u, 31u, 64u, 127u, 16384u, 65536u, 131072u })
++        {
++            auto enginePtr = std::make_unique<TestStateMachineEngine>();
++            auto& engine = *enginePtr;
++            StateMachine machine{ std::move(enginePtr) };
++            engine.pfnFlushToTerminal = std::bind(&StateMachine::FlushToTerminal, &machine);
++            for (size_t offset = 0; offset < input.size(); offset += chunkSize)
++            {
++                machine.ProcessString(std::wstring_view{ input }.substr(offset, chunkSize));
++            }
++            VERIFY_ARE_EQUAL(input, engine.passedThrough);
++        }
++    }
++}
++
+ void StateMachineTest::TwoStateMachinesDoNotInterfereWithEachOther()
+ {
+     auto firstEnginePtr{ std::make_unique<TestStateMachineEngine>() };

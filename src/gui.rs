@@ -3930,18 +3930,10 @@ impl MultiplexerView {
                                 .or_insert_with(|| {
                                     // Replicate the edge texels so linear filtering cannot
                                     // sample transparent atlas padding when enlarging images.
-                                    let buffer = image::RgbaImage::from_fn(
-                                        placement.width + 2,
-                                        placement.height + 2,
-                                        |x, y| {
-                                            let x = x.saturating_sub(1).min(placement.width - 1);
-                                            let y = y.saturating_sub(1).min(placement.height - 1);
-                                            let start = (y as usize * placement.width as usize
-                                                + x as usize)
-                                                * 4;
-                                            let p = &placement.rgba[start..start + 4];
-                                            image::Rgba([p[2], p[1], p[0], p[3]])
-                                        },
+                                    let buffer = terminal_image_texture(
+                                        &placement.rgba,
+                                        placement.width,
+                                        placement.height,
                                     );
                                     Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
                                         buffer,
@@ -5214,6 +5206,36 @@ fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
     }
 }
 
+fn terminal_image_texture(rgba: &[u8], width: u32, height: u32) -> image::RgbaImage {
+    let stride = (width as usize + 2) * 4;
+    let height_usize = height as usize;
+    let mut pixels = vec![0; stride * (height_usize + 2)];
+    // Convert one contiguous row at a time. Avoid coordinate division and
+    // clamping for every pixel so the channel shuffle can be vectorized.
+    for (source, row) in rgba
+        .chunks_exact(width as usize * 4)
+        .zip(pixels[stride..stride * (height_usize + 1)].chunks_exact_mut(stride))
+    {
+        for (pixel, output) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(row[4..stride - 4].as_chunks_mut::<4>().0.iter_mut())
+        {
+            *output = [pixel[2], pixel[1], pixel[0], pixel[3]];
+        }
+        row.copy_within(4..8, 0);
+        row.copy_within(stride - 8..stride - 4, stride - 4);
+    }
+    pixels.copy_within(stride..stride * 2, 0);
+    pixels.copy_within(
+        stride * height_usize..stride * (height_usize + 1),
+        stride * (height_usize + 1),
+    );
+    image::RgbaImage::from_raw(width + 2, height + 2, pixels)
+        .expect("terminal image has validated dimensions")
+}
+
 fn paint_terminal_images(
     images: &[(crate::TerminalImage, Arc<gpui::RenderImage>)],
     bounds: Bounds<Pixels>,
@@ -5579,6 +5601,61 @@ mod tests {
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn image_texture_preserves_alpha_and_replicates_all_edges() {
+        for (width, height) in [(1, 1), (1, 7), (7, 1), (3, 5)] {
+            let rgba = (0..width * height * 4)
+                .map(|index| (index * 71 % 256) as u8)
+                .collect::<Vec<_>>();
+            let actual = super::terminal_image_texture(&rgba, width, height);
+            let expected = image::RgbaImage::from_fn(width + 2, height + 2, |x, y| {
+                let x = x.saturating_sub(1).min(width - 1);
+                let y = y.saturating_sub(1).min(height - 1);
+                let pixel = &rgba[((y * width + x) * 4) as usize..];
+                image::Rgba([pixel[2], pixel[1], pixel[0], pixel[3]])
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual comparison of image texture packing implementations"]
+    fn profile_image_texture_preparation() {
+        use std::{hint::black_box, time::Instant};
+        for (width, height) in [(498, 498), (1920, 1080)] {
+            let rgba = (0..width * height * 4)
+                .map(|index| (index * 71 % 256) as u8)
+                .collect::<Vec<_>>();
+            let old = |rgba: &[u8]| {
+                image::RgbaImage::from_fn(width + 2, height + 2, |x, y| {
+                    let x = x.saturating_sub(1).min(width - 1);
+                    let y = y.saturating_sub(1).min(height - 1);
+                    let pixel = &rgba[((y * width + x) * 4) as usize..];
+                    image::Rgba([pixel[2], pixel[1], pixel[0], pixel[3]])
+                })
+            };
+            for round in 0..4 {
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(old(black_box(&rgba)));
+                }
+                let old_elapsed = start.elapsed() / 100;
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(super::terminal_image_texture(
+                        black_box(&rgba),
+                        width,
+                        height,
+                    ));
+                }
+                eprintln!(
+                    "Texture {width}x{height} round={round} old={old_elapsed:?} rows={:?}",
+                    start.elapsed() / 100
+                );
+            }
+        }
+    }
 
     #[test]
     fn keyboard_navigation_wraps_and_handles_empty_or_missing_selection() {

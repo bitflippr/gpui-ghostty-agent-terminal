@@ -1,0 +1,844 @@
+{
+  "date": "2026-09-07",
+  "platform": "Windows x64",
+  "build_profile": "cargo dev (opt-level=1), libghostty-vt ReleaseSafe",
+  "input": {
+    "bytes": 22813430,
+    "width": 498,
+    "height": 498,
+    "frames": 159,
+    "sha256": "1242a9638ad76dcf59f0cc77ff5a5a7f79ba01f4c16c7eb543d6ef29089c2a60",
+    "recompressed": false
+  },
+  "baseline_terminal_commit": "b95968c",
+  "optimized_client_source": "edfbccb85bed14c7325f4841a42c84221b99b29c with scripts/interop/draconis-image-client/draconis-image-client.patch",
+  "patched_runtime": "1.24.260710001-agent.1",
+  "before_after_boundary": "Command submission immediately after shell spawn to completion marker; fresh Terminal Session per sample; four variants rotated across twelve rounds.",
+  "before_after": [
+    {
+      "round": 1,
+      "label": "before-no-gif",
+      "completed_ms": 186.7285
+    },
+    {
+      "round": 1,
+      "label": "before-gif",
+      "completed_ms": 759.6562
+    },
+    {
+      "round": 1,
+      "label": "after-no-gif",
+      "completed_ms": 164.1614
+    },
+    {
+      "round": 1,
+      "label": "after-gif",
+      "completed_ms": 259.6375
+    },
+    {
+      "round": 2,
+      "label": "before-gif",
+      "completed_ms": 769.5801
+    },
+    {
+      "round": 2,
+      "label": "after-no-gif",
+      "completed_ms": 163.1927
+    },
+    {
+      "round": 2,
+      "label": "after-gif",
+      "completed_ms": 256.4792
+    },
+    {
+      "round": 2,
+      "label": "before-no-gif",
+      "completed_ms": 162.5712
+    },
+    {
+      "round": 3,
+      "label": "after-no-gif",
+      "completed_ms": 233.7773
+    },
+    {
+      "round": 3,
+      "label": "after-gif",
+      "completed_ms": 266.5467
+    },
+    {
+      "round": 3,
+      "label": "before-no-gif",
+      "completed_ms": 165.0063
+    },
+    {
+      "round": 3,
+      "label": "before-gif",
+      "completed_ms": 775.485
+    },
+    {
+      "round": 4,
+      "label": "after-gif",
+      "completed_ms": 264.9976
+    },
+    {
+      "round": 4,
+      "label": "before-no-gif",
+      "completed_ms": 164.9677
+    },
+    {
+      "round": 4,
+      "label": "before-gif",
+      "completed_ms": 811.8561
+    },
+    {
+      "round": 4,
+      "label": "after-no-gif",
+      "completed_ms": 164.208
+    },
+    {
+      "round": 5,
+      "label": "before-no-gif",
+      "completed_ms": 164.9487
+    },
+    {
+      "round": 5,
+      "label": "before-gif",
+      "completed_ms": 760.5582
+    },
+    {
+      "round": 5,
+      "label": "after-no-gif",
+      "completed_ms": 187.1914
+    },
+    {
+      "round": 5,
+      "label": "after-gif",
+      "completed_ms": 257.4546
+    },
+    {
+      "round": 6,
+      "label": "before-gif",
+      "completed_ms": 767.223
+    },
+    {
+      "round": 6,
+      "label": "after-no-gif",
+      "completed_ms": 164.3295
+    },
+    {
+      "round": 6,
+      "label": "after-gif",
+      "completed_ms": 255.4121
+    },
+    {
+      "round": 6,
+      "label": "before-no-gif",
+      "completed_ms": 195.125
+    },
+    {
+      "round": 7,
+      "label": "after-no-gif",
+      "completed_ms": 194.4962
+    },
+    {
+      "round": 7,
+      "label": "after-gif",
+      "completed_ms": 259.4414
+    },
+    {
+      "round": 7,
+      "label": "before-no-gif",
+      "completed_ms": 164.73
+    },
+    {
+      "round": 7,
+      "label": "before-gif",
+      "completed_ms": 760.2889
+    },
+    {
+      "round": 8,
+      "label": "after-gif",
+      "completed_ms": 259.7104
+    },
+    {
+      "round": 8,
+      "label": "before-no-gif",
+      "completed_ms": 163.3049
+    },
+    {
+      "round": 8,
+      "label": "before-gif",
+      "completed_ms": 789.1995
+    },
+    {
+      "round": 8,
+      "label": "after-no-gif",
+      "completed_ms": 187.9294
+    },
+    {
+      "round": 9,
+      "label": "before-no-gif",
+      "completed_ms": 163.8889
+    },
+    {
+      "round": 9,
+      "label": "before-gif",
+      "completed_ms": 776.8945
+    },
+    {
+      "round": 9,
+      "label": "after-no-gif",
+      "completed_ms": 165.2107
+    },
+    {
+      "round": 9,
+      "label": "after-gif",
+      "completed_ms": 258.467
+    },
+    {
+      "round": 10,
+      "label": "before-gif",
+      "completed_ms": 786.9018
+    },
+    {
+      "round": 10,
+      "label": "after-no-gif",
+      "completed_ms": 165.0559
+    },
+    {
+      "round": 10,
+      "label": "after-gif",
+      "completed_ms": 288.0415
+    },
+    {
+      "round": 10,
+      "label": "before-no-gif",
+      "completed_ms": 165.7051
+    },
+    {
+      "round": 11,
+      "label": "after-no-gif",
+      "completed_ms": 223.1594
+    },
+    {
+      "round": 11,
+      "label": "after-gif",
+      "completed_ms": 319.1043
+    },
+    {
+      "round": 11,
+      "label": "before-no-gif",
+      "completed_ms": 188.9738
+    },
+    {
+      "round": 11,
+      "label": "before-gif",
+      "completed_ms": 760.5834
+    },
+    {
+      "round": 12,
+      "label": "after-gif",
+      "completed_ms": 255.1035
+    },
+    {
+      "round": 12,
+      "label": "before-no-gif",
+      "completed_ms": 162.8069
+    },
+    {
+      "round": 12,
+      "label": "before-gif",
+      "completed_ms": 758.5099
+    },
+    {
+      "round": 12,
+      "label": "after-no-gif",
+      "completed_ms": 162.1072
+    }
+  ],
+  "runtime_comparison_boundary": "Command submission after shell-ready marker to first image snapshot and completion marker; updated VT engine throughout; fresh Terminal Session per sample; runtime order alternates and client order rotates each round.",
+  "runtime_comparison": [
+    {
+      "round": 1,
+      "label": "no-gif",
+      "shell_ready_ms": 102.9828,
+      "first_image_ms": null,
+      "completed_ms": 146.5045,
+      "runtime": "bundled"
+    },
+    {
+      "round": 1,
+      "label": "original",
+      "shell_ready_ms": 103.2966,
+      "first_image_ms": 410.50759999999997,
+      "completed_ms": 422.3235,
+      "runtime": "bundled"
+    },
+    {
+      "round": 1,
+      "label": "fast",
+      "shell_ready_ms": 119.2603,
+      "first_image_ms": 150.3851,
+      "completed_ms": 162.017,
+      "runtime": "bundled"
+    },
+    {
+      "round": 1,
+      "label": "no-gif",
+      "shell_ready_ms": 113.357,
+      "first_image_ms": null,
+      "completed_ms": 99.52560000000001,
+      "runtime": "stock"
+    },
+    {
+      "round": 1,
+      "label": "original",
+      "shell_ready_ms": 118.5871,
+      "first_image_ms": 606.3939,
+      "completed_ms": 618.2597,
+      "runtime": "stock"
+    },
+    {
+      "round": 1,
+      "label": "fast",
+      "shell_ready_ms": 118.221,
+      "first_image_ms": 328.19160000000005,
+      "completed_ms": 340.09270000000004,
+      "runtime": "stock"
+    },
+    {
+      "round": 2,
+      "label": "original",
+      "shell_ready_ms": 99.7026,
+      "first_image_ms": 607.5390000000001,
+      "completed_ms": 619.3748999999999,
+      "runtime": "stock"
+    },
+    {
+      "round": 2,
+      "label": "fast",
+      "shell_ready_ms": 119.9112,
+      "first_image_ms": 329.3566,
+      "completed_ms": 341.079,
+      "runtime": "stock"
+    },
+    {
+      "round": 2,
+      "label": "no-gif",
+      "shell_ready_ms": 105.0427,
+      "first_image_ms": null,
+      "completed_ms": 98.9987,
+      "runtime": "stock"
+    },
+    {
+      "round": 2,
+      "label": "original",
+      "shell_ready_ms": 101.919,
+      "first_image_ms": 434.55670000000003,
+      "completed_ms": 445.7585,
+      "runtime": "bundled"
+    },
+    {
+      "round": 2,
+      "label": "fast",
+      "shell_ready_ms": 108.0448,
+      "first_image_ms": 152.0003,
+      "completed_ms": 163.7637,
+      "runtime": "bundled"
+    },
+    {
+      "round": 2,
+      "label": "no-gif",
+      "shell_ready_ms": 105.7698,
+      "first_image_ms": null,
+      "completed_ms": 98.44659999999999,
+      "runtime": "bundled"
+    },
+    {
+      "round": 3,
+      "label": "fast",
+      "shell_ready_ms": 100.44250000000001,
+      "first_image_ms": 155.6256,
+      "completed_ms": 167.6644,
+      "runtime": "bundled"
+    },
+    {
+      "round": 3,
+      "label": "no-gif",
+      "shell_ready_ms": 120.03790000000001,
+      "first_image_ms": null,
+      "completed_ms": 98.90899999999999,
+      "runtime": "bundled"
+    },
+    {
+      "round": 3,
+      "label": "original",
+      "shell_ready_ms": 118.6389,
+      "first_image_ms": 407.441,
+      "completed_ms": 419.4989,
+      "runtime": "bundled"
+    },
+    {
+      "round": 3,
+      "label": "fast",
+      "shell_ready_ms": 109.017,
+      "first_image_ms": 329.2099,
+      "completed_ms": 340.9678,
+      "runtime": "stock"
+    },
+    {
+      "round": 3,
+      "label": "no-gif",
+      "shell_ready_ms": 105.35369999999999,
+      "first_image_ms": null,
+      "completed_ms": 95.5617,
+      "runtime": "stock"
+    },
+    {
+      "round": 3,
+      "label": "original",
+      "shell_ready_ms": 106.3174,
+      "first_image_ms": 593.1335,
+      "completed_ms": 604.2851,
+      "runtime": "stock"
+    },
+    {
+      "round": 4,
+      "label": "no-gif",
+      "shell_ready_ms": 110.3629,
+      "first_image_ms": null,
+      "completed_ms": 97.3141,
+      "runtime": "stock"
+    },
+    {
+      "round": 4,
+      "label": "original",
+      "shell_ready_ms": 118.38260000000001,
+      "first_image_ms": 607.5886,
+      "completed_ms": 627.4055,
+      "runtime": "stock"
+    },
+    {
+      "round": 4,
+      "label": "fast",
+      "shell_ready_ms": 116.6181,
+      "first_image_ms": 334.03749999999997,
+      "completed_ms": 345.322,
+      "runtime": "stock"
+    },
+    {
+      "round": 4,
+      "label": "no-gif",
+      "shell_ready_ms": 113.6453,
+      "first_image_ms": null,
+      "completed_ms": 100.3648,
+      "runtime": "bundled"
+    },
+    {
+      "round": 4,
+      "label": "original",
+      "shell_ready_ms": 119.3716,
+      "first_image_ms": 419.9958,
+      "completed_ms": 432.592,
+      "runtime": "bundled"
+    },
+    {
+      "round": 4,
+      "label": "fast",
+      "shell_ready_ms": 119.2793,
+      "first_image_ms": 176.9148,
+      "completed_ms": 189.1829,
+      "runtime": "bundled"
+    },
+    {
+      "round": 5,
+      "label": "original",
+      "shell_ready_ms": 115.6413,
+      "first_image_ms": 410.8433,
+      "completed_ms": 422.0765,
+      "runtime": "bundled"
+    },
+    {
+      "round": 5,
+      "label": "fast",
+      "shell_ready_ms": 108.9083,
+      "first_image_ms": 150.002,
+      "completed_ms": 161.3574,
+      "runtime": "bundled"
+    },
+    {
+      "round": 5,
+      "label": "no-gif",
+      "shell_ready_ms": 105.2384,
+      "first_image_ms": null,
+      "completed_ms": 95.3586,
+      "runtime": "bundled"
+    },
+    {
+      "round": 5,
+      "label": "original",
+      "shell_ready_ms": 95.69279999999999,
+      "first_image_ms": 616.6831999999999,
+      "completed_ms": 627.9172,
+      "runtime": "stock"
+    },
+    {
+      "round": 5,
+      "label": "fast",
+      "shell_ready_ms": 105.6566,
+      "first_image_ms": 336.806,
+      "completed_ms": 348.1395,
+      "runtime": "stock"
+    },
+    {
+      "round": 5,
+      "label": "no-gif",
+      "shell_ready_ms": 105.6652,
+      "first_image_ms": null,
+      "completed_ms": 98.38900000000001,
+      "runtime": "stock"
+    },
+    {
+      "round": 6,
+      "label": "fast",
+      "shell_ready_ms": 110.9658,
+      "first_image_ms": 334.44390000000004,
+      "completed_ms": 345.7006,
+      "runtime": "stock"
+    },
+    {
+      "round": 6,
+      "label": "no-gif",
+      "shell_ready_ms": 117.6314,
+      "first_image_ms": null,
+      "completed_ms": 98.3235,
+      "runtime": "stock"
+    },
+    {
+      "round": 6,
+      "label": "original",
+      "shell_ready_ms": 105.8042,
+      "first_image_ms": 598.8464,
+      "completed_ms": 610.0986,
+      "runtime": "stock"
+    },
+    {
+      "round": 6,
+      "label": "fast",
+      "shell_ready_ms": 125.326,
+      "first_image_ms": 165.23,
+      "completed_ms": 177.318,
+      "runtime": "bundled"
+    },
+    {
+      "round": 6,
+      "label": "no-gif",
+      "shell_ready_ms": 106.437,
+      "first_image_ms": null,
+      "completed_ms": 97.4763,
+      "runtime": "bundled"
+    },
+    {
+      "round": 6,
+      "label": "original",
+      "shell_ready_ms": 122.20920000000001,
+      "first_image_ms": 608.0194,
+      "completed_ms": 620.1459,
+      "runtime": "bundled"
+    },
+    {
+      "round": 7,
+      "label": "no-gif",
+      "shell_ready_ms": 121.1134,
+      "first_image_ms": null,
+      "completed_ms": 104.1016,
+      "runtime": "bundled"
+    },
+    {
+      "round": 7,
+      "label": "original",
+      "shell_ready_ms": 124.4252,
+      "first_image_ms": 464.5215,
+      "completed_ms": 476.7065,
+      "runtime": "bundled"
+    },
+    {
+      "round": 7,
+      "label": "fast",
+      "shell_ready_ms": 120.155,
+      "first_image_ms": 170.8915,
+      "completed_ms": 183.2971,
+      "runtime": "bundled"
+    },
+    {
+      "round": 7,
+      "label": "no-gif",
+      "shell_ready_ms": 110.1528,
+      "first_image_ms": null,
+      "completed_ms": 100.12859999999999,
+      "runtime": "stock"
+    },
+    {
+      "round": 7,
+      "label": "original",
+      "shell_ready_ms": 121.13680000000001,
+      "first_image_ms": 651.8797,
+      "completed_ms": 664.1901,
+      "runtime": "stock"
+    },
+    {
+      "round": 7,
+      "label": "fast",
+      "shell_ready_ms": 125.106,
+      "first_image_ms": 369.11899999999997,
+      "completed_ms": 381.28659999999996,
+      "runtime": "stock"
+    },
+    {
+      "round": 8,
+      "label": "original",
+      "shell_ready_ms": 127.66730000000001,
+      "first_image_ms": 750.2748,
+      "completed_ms": 762.5698,
+      "runtime": "stock"
+    },
+    {
+      "round": 8,
+      "label": "fast",
+      "shell_ready_ms": 120.3734,
+      "first_image_ms": 348.06949999999995,
+      "completed_ms": 359.6496,
+      "runtime": "stock"
+    },
+    {
+      "round": 8,
+      "label": "no-gif",
+      "shell_ready_ms": 105.1479,
+      "first_image_ms": null,
+      "completed_ms": 98.1038,
+      "runtime": "stock"
+    },
+    {
+      "round": 8,
+      "label": "original",
+      "shell_ready_ms": 100.9435,
+      "first_image_ms": 411.2126,
+      "completed_ms": 422.5948,
+      "runtime": "bundled"
+    },
+    {
+      "round": 8,
+      "label": "fast",
+      "shell_ready_ms": 119.5934,
+      "first_image_ms": 151.9349,
+      "completed_ms": 163.3852,
+      "runtime": "bundled"
+    },
+    {
+      "round": 8,
+      "label": "no-gif",
+      "shell_ready_ms": 107.9547,
+      "first_image_ms": null,
+      "completed_ms": 97.7124,
+      "runtime": "bundled"
+    },
+    {
+      "round": 9,
+      "label": "fast",
+      "shell_ready_ms": 102.0963,
+      "first_image_ms": 153.3551,
+      "completed_ms": 165.3242,
+      "runtime": "bundled"
+    },
+    {
+      "round": 9,
+      "label": "no-gif",
+      "shell_ready_ms": 106.4189,
+      "first_image_ms": null,
+      "completed_ms": 97.7462,
+      "runtime": "bundled"
+    },
+    {
+      "round": 9,
+      "label": "original",
+      "shell_ready_ms": 108.1324,
+      "first_image_ms": 413.4766,
+      "completed_ms": 425.0961,
+      "runtime": "bundled"
+    },
+    {
+      "round": 9,
+      "label": "fast",
+      "shell_ready_ms": 95.3481,
+      "first_image_ms": 324.66830000000004,
+      "completed_ms": 336.24989999999997,
+      "runtime": "stock"
+    },
+    {
+      "round": 9,
+      "label": "no-gif",
+      "shell_ready_ms": 117.6746,
+      "first_image_ms": null,
+      "completed_ms": 106.0798,
+      "runtime": "stock"
+    },
+    {
+      "round": 9,
+      "label": "original",
+      "shell_ready_ms": 122.8017,
+      "first_image_ms": 598.506,
+      "completed_ms": 609.6952,
+      "runtime": "stock"
+    },
+    {
+      "round": 10,
+      "label": "no-gif",
+      "shell_ready_ms": 96.0579,
+      "first_image_ms": null,
+      "completed_ms": 97.0269,
+      "runtime": "stock"
+    },
+    {
+      "round": 10,
+      "label": "original",
+      "shell_ready_ms": 104.3312,
+      "first_image_ms": 600.6519999999999,
+      "completed_ms": 612.7617,
+      "runtime": "stock"
+    },
+    {
+      "round": 10,
+      "label": "fast",
+      "shell_ready_ms": 105.15950000000001,
+      "first_image_ms": 321.4129,
+      "completed_ms": 332.9138,
+      "runtime": "stock"
+    },
+    {
+      "round": 10,
+      "label": "no-gif",
+      "shell_ready_ms": 100.2333,
+      "first_image_ms": null,
+      "completed_ms": 97.5269,
+      "runtime": "bundled"
+    },
+    {
+      "round": 10,
+      "label": "original",
+      "shell_ready_ms": 117.50819999999999,
+      "first_image_ms": 432.3176,
+      "completed_ms": 444.4619,
+      "runtime": "bundled"
+    },
+    {
+      "round": 10,
+      "label": "fast",
+      "shell_ready_ms": 105.34150000000001,
+      "first_image_ms": 152.9032,
+      "completed_ms": 164.363,
+      "runtime": "bundled"
+    },
+    {
+      "round": 11,
+      "label": "original",
+      "shell_ready_ms": 123.2347,
+      "first_image_ms": 409.5601,
+      "completed_ms": 420.90729999999996,
+      "runtime": "bundled"
+    },
+    {
+      "round": 11,
+      "label": "fast",
+      "shell_ready_ms": 118.3081,
+      "first_image_ms": 169.9284,
+      "completed_ms": 182.3292,
+      "runtime": "bundled"
+    },
+    {
+      "round": 11,
+      "label": "no-gif",
+      "shell_ready_ms": 106.2887,
+      "first_image_ms": null,
+      "completed_ms": 96.7022,
+      "runtime": "bundled"
+    },
+    {
+      "round": 11,
+      "label": "original",
+      "shell_ready_ms": 98.7863,
+      "first_image_ms": 588.3747999999999,
+      "completed_ms": 600.4754,
+      "runtime": "stock"
+    },
+    {
+      "round": 11,
+      "label": "fast",
+      "shell_ready_ms": 107.0829,
+      "first_image_ms": 324.58029999999997,
+      "completed_ms": 336.9946,
+      "runtime": "stock"
+    },
+    {
+      "round": 11,
+      "label": "no-gif",
+      "shell_ready_ms": 121.3297,
+      "first_image_ms": null,
+      "completed_ms": 99.58160000000001,
+      "runtime": "stock"
+    },
+    {
+      "round": 12,
+      "label": "fast",
+      "shell_ready_ms": 101.0964,
+      "first_image_ms": 334.67010000000005,
+      "completed_ms": 346.4526,
+      "runtime": "stock"
+    },
+    {
+      "round": 12,
+      "label": "no-gif",
+      "shell_ready_ms": 120.2493,
+      "first_image_ms": null,
+      "completed_ms": 98.5714,
+      "runtime": "stock"
+    },
+    {
+      "round": 12,
+      "label": "original",
+      "shell_ready_ms": 105.0392,
+      "first_image_ms": 605.4007,
+      "completed_ms": 617.1753,
+      "runtime": "stock"
+    },
+    {
+      "round": 12,
+      "label": "fast",
+      "shell_ready_ms": 116.3733,
+      "first_image_ms": 166.6171,
+      "completed_ms": 178.2695,
+      "runtime": "bundled"
+    },
+    {
+      "round": 12,
+      "label": "no-gif",
+      "shell_ready_ms": 119.37979999999999,
+      "first_image_ms": null,
+      "completed_ms": 98.8704,
+      "runtime": "bundled"
+    },
+    {
+      "round": 12,
+      "label": "original",
+      "shell_ready_ms": 107.89659999999999,
+      "first_image_ms": 426.63250000000005,
+      "completed_ms": 438.2969,
+      "runtime": "bundled"
+    }
+  ],
+  "limitations": [
+    "No GPU presentation measurement",
+    "No macOS, Linux, or ARM64 performance measurement",
+    "Ordinary desktop scheduling introduces run-to-run variance",
+    "Full improvement requires the patched client as well as the terminal"
+  ]
+}

@@ -479,7 +479,7 @@ fn decode_image(
         if u64::from(decoded.width()) * u64::from(decoded.height()) * 4 > 64 * 1024 * 1024 {
             return false;
         }
-        let rgba = decoded.to_rgba8();
+        let rgba = decoded.into_rgba8();
         let pixels = unsafe { ghostty_alloc(allocator, rgba.len()) };
         if pixels.is_null() {
             return false;

@@ -8,7 +8,7 @@ use std::process::Command;
 const GHOSTTY_REVISION: &str = "4c725242b7dbe8c77c6e227ef1f9540c5ef17921";
 const GHOSTTY_INCLUDE_DIR_ENV: &str = "GHOSTTY_VT_INCLUDE_DIR";
 const GHOSTTY_LIB_DIR_ENV: &str = "GHOSTTY_VT_LIB_DIR";
-const CONPTY_VERSION: &str = "1.24.260710001";
+const CONPTY_VERSION: &str = "1.24.260710001-agent.1";
 const CONPTY_FILES: &[&str] = &[
     "conpty.dll",
     "x64/OpenConsole.exe",
@@ -19,6 +19,7 @@ const CONPTY_FILES: &[&str] = &[
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let upstream = root.join("vendor/ghostty");
+    let target = env::var("TARGET").expect("TARGET");
 
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed={GHOSTTY_INCLUDE_DIR_ENV}");
@@ -28,17 +29,25 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/ghostty/include");
     println!("cargo:rerun-if-changed=vendor/ghostty-patches/terminal-images.patch");
     println!("cargo:rustc-env=AGENT_TERMINAL_CONPTY_VERSION={CONPTY_VERSION}");
+    let mut runtime_hash = std::collections::hash_map::DefaultHasher::new();
     for relative in CONPTY_FILES {
-        println!(
-            "cargo:rerun-if-changed={}",
-            root.join("vendor/microsoft-conpty")
-                .join(CONPTY_VERSION)
-                .join(relative)
-                .display()
-        );
+        let path = root
+            .join("vendor/microsoft-conpty")
+            .join(CONPTY_VERSION)
+            .join(relative);
+        println!("cargo:rerun-if-changed={}", path.display());
+        relative.hash(&mut runtime_hash);
+        if target.contains("windows") {
+            fs::read(&path)
+                .expect("read bundled ConPTY runtime input")
+                .hash(&mut runtime_hash);
+        }
     }
+    println!(
+        "cargo:rustc-env=AGENT_TERMINAL_CONPTY_HASH_PREFIX={:016x}",
+        runtime_hash.finish()
+    );
 
-    let target = env::var("TARGET").expect("TARGET");
     let ghostty = if env::var_os(GHOSTTY_LIB_DIR_ENV).is_none()
         || env::var_os(GHOSTTY_INCLUDE_DIR_ENV).is_none()
     {

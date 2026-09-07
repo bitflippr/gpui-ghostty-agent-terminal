@@ -2230,7 +2230,7 @@ diff --git a/src/terminal/iterm_image.zig b/src/terminal/iterm_image.zig
 new file mode 100644
 --- /dev/null
 +++ b/src/terminal/iterm_image.zig
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,305 @@
 +//! iTerm2 OSC 1337 inline images. Parsing and cursor/scrollback ownership stay
 +//! in the terminal; the embedder supplies the image decoder through sys.
 +const std = @import("std");
@@ -2239,9 +2239,27 @@ new file mode 100644
 +const sys = @import("sys.zig");
 +const graphics = @import("kitty/graphics_storage.zig");
 +const options = @import("terminal_options");
++const simd = @import("../simd/main.zig");
 +const max_encoded = 96 * 1024 * 1024;
++const max_decoded = 64 * 1024 * 1024;
 +
 +pub const Command = extern struct { kind: u32, data: lib.String };
++
++fn decodedSize(input: []const u8) !usize {
++    return std.base64.standard.Decoder.calcSizeForSlice(input);
++}
++
++fn decodeBase64(input: []const u8, output: []u8) !void {
++    if (input.len == 0) return;
++    // SIMDUTF deliberately accepts whitespace and non-canonical trailing bits.
++    // Preserve the strict iTerm decoder: validate its final quartet with the
++    // standard decoder, then require the exact length (whitespace reduces it).
++    const tail = input[input.len - 4 ..];
++    var scratch: [3]u8 = undefined;
++    try std.base64.standard.Decoder.decode(scratch[0..try decodedSize(tail)], tail);
++    const decoded = try simd.base64.decode(input, output);
++    if (decoded.len != output.len) return error.InvalidData;
++}
 +
 +const Dimension = union(enum) {
 +    auto,
@@ -2269,8 +2287,79 @@ new file mode 100644
 +    }
 +};
 +
++test "iterm SIMD base64 preserves strict decoding" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var bytes: [257]u8 = undefined;
++    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 73 + 11);
++    var text: [std.base64.standard.Encoder.calcSize(bytes.len)]u8 = undefined;
++    for (0..bytes.len + 1) |len| {
++        const input = std.base64.standard.Encoder.encode(&text, bytes[0..len]);
++        const output = try alloc.alloc(u8, try decodedSize(input));
++        defer alloc.free(output);
++        try decodeBase64(input, output);
++        try testing.expectEqualSlices(u8, bytes[0..len], output);
++    }
++
++    // Compare to the old strict decoder for every byte at each position,
++    // including embedded padding, whitespace, high bytes and trailing bits.
++    for ([_][]const u8{ "aGVsbG8=", "aGVsbA==", "aGVsbG8h" }) |valid| {
++        var input: [8]u8 = undefined;
++        for (0..input.len) |position| {
++            for (0..256) |value| {
++                @memcpy(&input, valid);
++                input[position] = @intCast(value);
++                const len = decodedSize(&input) catch continue;
++                var expected: [6]u8 = undefined;
++                var actual: [6]u8 = undefined;
++                const accepted = if (std.base64.standard.Decoder.decode(expected[0..len], &input)) |_| true else |_| false;
++                const result = decodeBase64(&input, actual[0..len]);
++                if (accepted) {
++                    try result;
++                    try testing.expectEqualSlices(u8, expected[0..len], actual[0..len]);
++                } else {
++                    try testing.expect(if (result) |_| false else |_| true);
++                }
++            }
++        }
++    }
++}
++
++test "iterm multipart base64 preserves every split and final padding" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var bytes: [257]u8 = undefined;
++    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 73 + 11);
++    var text: [std.base64.standard.Encoder.calcSize(bytes.len)]u8 = undefined;
++    for (0..bytes.len + 1) |len| {
++        const input = std.base64.standard.Encoder.encode(&text, bytes[0..len]);
++        for (1..18) |chunk_size| {
++            var transfer: Transfer = .{};
++            defer transfer.deinit(alloc);
++            var offset: usize = 0;
++            while (offset < input.len) {
++                const end = @min(offset + chunk_size, input.len);
++                try transfer.append(alloc, input[offset..end]);
++                offset = end;
++            }
++            try transfer.appendDecoded(alloc, transfer.pending[0..transfer.pending_len], true);
++            try testing.expectEqualSlices(u8, bytes[0..len], transfer.data.items);
++            try testing.expectEqual(input.len, transfer.encoded_len);
++        }
++    }
++    var transfer: Transfer = .{};
++    defer transfer.deinit(alloc);
++    try transfer.append(alloc, "Zg==");
++    try testing.expectError(error.InvalidPadding, transfer.append(alloc, "YQ=="));
++}
++
 +pub const Transfer = struct {
++    // Multipart data is decoded as it arrives. Keep only the last quartet so
++    // FileParts may split anywhere, including between padding characters.
 +    data: std.ArrayList(u8) = .empty,
++    pending: [4]u8 = undefined,
++    pending_len: usize = 0,
++    encoded_len: usize = 0,
 +    active: bool = false,
 +    name: []const u8 = &.{},
 +    inline_image: bool = false,
@@ -2312,8 +2401,35 @@ new file mode 100644
 +    }
 +
 +    fn append(self: *Transfer, alloc: std.mem.Allocator, data: []const u8) !void {
-+        if (data.len > max_encoded -| self.data.items.len) return error.ImageTooLarge;
-+        try self.data.appendSlice(alloc, data);
++        if (data.len > max_encoded -| self.encoded_len) return error.ImageTooLarge;
++        self.encoded_len += data.len;
++        if (data.len == 0) return;
++        var rest = data;
++        if (self.pending_len > 0) {
++            const take = @min(4 - self.pending_len, rest.len);
++            @memcpy(self.pending[self.pending_len..][0..take], rest[0..take]);
++            self.pending_len += take;
++            rest = rest[take..];
++            if (rest.len == 0) return;
++            // Padding is only valid in the very last quartet of the transfer.
++            try self.appendDecoded(alloc, &self.pending, false);
++            self.pending_len = 0;
++        }
++        const complete = (rest.len - 1) / 4 * 4;
++        try self.appendDecoded(alloc, rest[0..complete], false);
++        rest = rest[complete..];
++        @memcpy(self.pending[0..rest.len], rest);
++        self.pending_len = rest.len;
++    }
++
++    fn appendDecoded(self: *Transfer, alloc: std.mem.Allocator, input: []const u8, final: bool) !void {
++        const len = try decodedSize(input);
++        if (!final and len != input.len / 4 * 3) return error.InvalidPadding;
++        if (len > max_decoded -| self.data.items.len) return error.ImageTooLarge;
++        const start = self.data.items.len;
++        try self.data.resize(alloc, start + len);
++        errdefer self.data.items.len = start;
++        try decodeBase64(input, self.data.items[start..]);
 +    }
 +
 +    pub fn process(self: *Transfer, t: *Terminal, cmd: Command, handler: anytype) !void {
@@ -2326,8 +2442,14 @@ new file mode 100644
 +                defer self.deinit(alloc);
 +                const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidData;
 +                try self.metadata(alloc, text[0..colon]);
-+                try self.append(alloc, text[colon + 1 ..]);
-+                try self.finish(t, handler);
++                const input = text[colon + 1 ..];
++                if (input.len > max_encoded) return error.ImageTooLarge;
++                const len = try decodedSize(input);
++                if (len > max_decoded) return error.ImageTooLarge;
++                const decoded = try alloc.alloc(u8, len);
++                defer alloc.free(decoded);
++                try decodeBase64(input, decoded);
++                try self.finish(t, handler, decoded);
 +            },
 +            1 => {
 +                self.deinit(alloc);
@@ -2342,7 +2464,8 @@ new file mode 100644
 +            3 => {
 +                defer self.deinit(alloc);
 +                if (!self.active) return error.NoTransfer;
-+                try self.finish(t, handler);
++                try self.appendDecoded(alloc, self.pending[0..self.pending_len], true);
++                try self.finish(t, handler, self.data.items);
 +            },
 +            4 => {
 +                if (sys.decode_image != null and t.screens.active.kitty_images.enabled()) {
@@ -2353,15 +2476,9 @@ new file mode 100644
 +        }
 +    }
 +
-+    fn finish(self: *Transfer, t: *Terminal, handler: anytype) !void {
++    fn finish(self: *Transfer, t: *Terminal, handler: anytype, encoded: []const u8) !void {
 +        const alloc = t.gpa();
 +        const storage = &t.screens.active.kitty_images;
-+        const base64 = std.base64.standard.Decoder;
-+        const len = try base64.calcSizeForSlice(self.data.items);
-+        if (len > 64 * 1024 * 1024) return error.ImageTooLarge;
-+        const encoded = try alloc.alloc(u8, len);
-+        defer alloc.free(encoded);
-+        try base64.decode(encoded, self.data.items);
 +        if (!self.inline_image) {
 +            const callback = handler.effects.file_download orelse return;
 +            callback(handler, self.name, encoded);

@@ -58,6 +58,18 @@ development builds use Zig `ReleaseSafe`; unoptimized tests retain Zig `Debug`.
 
 OSC payloads are collected in slices inside libghostty-vt. Controls still pass
 through the VT state machine; the bulk path is checked against scalar parsing.
+iTerm2 base64 decoding uses the existing SIMD decoder while retaining strict
+alphabet, padding and trailing-bit validation. Multipart transfers decode each
+part into the destination buffer, carrying incomplete quartets between parts.
+Single-sequence transfers avoid copying the complete encoded payload.
+
+Windows x64 uses a [patched ConPTY host](../vendor/microsoft-conpty-patches/README.md)
+that batches printable OSC parsing, skips an unused incomplete-sequence copy,
+and avoids scanning image bodies for the unrelated SetMark action. Controls
+and raw passthrough retain their existing behavior. The original Microsoft
+DLL and ARM64 host are preserved; ARM64 has no measured performance change.
+The bundle's version and content identify its cache, and a per-user file lock
+serializes cache publication and repair.
 
 ## Validation and reproduction
 
@@ -83,20 +95,75 @@ seconds. It does not assert timing thresholds or modify client configuration.
 It also reports command completion. Set `IMAGE_PROTOCOL_TEST_ANIMATION=0` to
 measure completion alone, for example with the same client without its image.
 
-For the 22.8 MB, 159-frame GIF used during Windows validation, in-memory VT
-input through the first image snapshot fell from about 1.0 seconds to 82 ms.
-Repeated native client runs measured 0.81–0.85 seconds, with an additional slower
-run at 1.37 seconds, compared with the earlier 1.58 seconds. Paired runs without
-the GIF measured 0.17–0.25 seconds. These are
-development-build observations, not startup guarantees or GPU presentation
-timings. A controlled sender spent about 330 ms writing the 30.4 MB encoded
-payload through ConPTY. Instrumenting the image client measured 62 ms building
-its sequence and 484 ms writing it; the cell-size query returned in 16 ms.
-Minimizing the remaining client and transport overhead is still an open
-performance goal. Upstream ConPTY's
-[OSC parser](https://github.com/microsoft/terminal/blob/main/src/terminal/parser/stateMachine.cpp)
-collects strings character by character; this is a candidate for further
-profiling, not a confirmed attribution of the entire remaining delay.
+For a comparison that waits for the command shell to become ready before
+timing, set `IMAGE_PROTOCOL_BENCH_VARIANTS` to a JSON file such as:
+
+```json
+[
+  {"label": "plain", "command": "image-client.exe", "expect_image": false},
+  {"label": "image", "command": "image-client.exe --logo-path fixture.gif --logo-protocol iterm2", "expect_image": true}
+]
+```
+
+Use commands and input paths valid from the terminal's working directory.
+Run `cargo test --profile dev --lib compare_image_client_startup_through_conpty -- --ignored --nocapture`.
+Each sample starts a fresh Terminal Session; each round rotates variant order.
+`IMAGE_PROTOCOL_BENCH_ROUNDS` selects 1–100 rounds, defaulting to six. Output
+records shell readiness, first image snapshot and command completion separately.
+Tests can explicitly select another runtime with the absolute directory
+`IMAGE_PROTOCOL_BENCH_CONPTY_DIR`; production builds ignore this variable.
+
+### Windows performance checkpoint
+
+The September 7 measurements used the original 22,813,430-byte, 498-by-498,
+159-frame GIF, transferred without recompression. The optimized
+[Draconis++ interoperability client](../scripts/interop/draconis-image-client/README.md)
+streams 64 KiB iTerm2 multipart sequences, reuses buffers, and uses AVX2 base64
+encoding when supported, with a scalar fallback. Its isolated encoding time
+fell from about 50 ms to 8 ms. The largest end-to-end improvement requires
+both this client and the terminal changes.
+
+Twelve interleaved repetitions per variant, measured from command submission
+immediately after spawning the shell through its completion marker:
+
+| Configuration | Before median (range) | After median (range) |
+| --- | --- | --- |
+| Draconis++ without GIF | 165.0 ms (162.6–195.1) | 165.1 ms (162.1–233.8) |
+| Draconis++ with GIF | 768.4 ms (758.5–811.9) | 259.5 ms (255.1–319.1) |
+
+The earlier terminal build is `b95968c`, paired with the original sender; the
+after measurement uses the optimized client and bundled x64 host. Total time
+with the GIF fell 66%, and
+its added delay over the run without the GIF fell from 603 ms to 94 ms, or 84%.
+
+A separate twelve-round comparison waited for shell readiness before timing,
+alternated runtime order, rotated client order, and used the same updated VT
+engine for every sample:
+
+| Client | Original Microsoft ConPTY | Patched bundled ConPTY |
+| --- | --- | --- |
+| Without GIF | 98.5 ms | 98.1 ms |
+| Original image sender | 617.7 ms | 428.8 ms |
+| Optimized multipart sender | 343.2 ms | 166.5 ms |
+
+The optimized path's first image snapshot arrived at a median 154.5 ms; command
+completion ranged from 161.4 to 189.2 ms. In-memory single-sequence VT input
+through the first snapshot improved from a median 86 ms to 55 ms in three
+paired runs. Preparing a 498-by-498 texture fell from about 0.86 ms to 0.38 ms
+per frame; the check verifies identical channel order, alpha and replicated
+borders. Higher Rust development optimization did not improve command timing,
+so the normal development profile remains unchanged.
+
+These are development-build observations, not startup guarantees or GPU
+presentation timings. Shell creation, command submission, first snapshot and
+visible presentation are distinct measurement boundaries. The complete client
+test still observed all 159 distinct frames over seven seconds. Sanitized
+per-run results are in [the benchmark data](benchmarks/terminal-images-2026-09-07.json).
+ConPTY parsing and dispatch passed 761 upstream parser tests with one existing
+skip, plus the targeted adapter test. The packaged host build recipe was also
+executed successfully. Operator retesting confirmed the final GUI's visible
+improvement. macOS/Linux runtime validation and GPU presentation measurements
+remain open.
 
 Windows visual validation includes alpha, cropped placements, scaled single
 pixels, and a 498-by-498 animated GIF with 159 frames through an image client.
