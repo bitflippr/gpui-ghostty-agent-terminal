@@ -46,7 +46,20 @@ cargo run -- --development
 
 # Optimized development launch
 cargo run --release -- --development
+
+# Rebuild and restart the development app when source files change
+cargo install --locked bacon
+bacon
 ```
+
+The project's `bacon.toml` runs `cargo run -- --development` and restarts it on
+changes. On Windows, configure the run job's `kill` command as
+`["taskkill", "/F", "/T", "/PID"]` so restarting also stops Cargo's child app.
+For a machine-local override, copy `bacon.toml` to `.config/bacon.toml`, add that
+line under `[jobs.run]`, and exclude the local file in `.git/info/exclude`.
+
+See [Keyboard shortcuts](docs/keyboard-shortcuts.md) for navigation, layout,
+scrollback, and agent controls. Bindings are editable in Settings.
 
 The renderer selects and verifies a native fixed-pitch family on each platform:
 Menlo/SF Mono on macOS, Cascadia Mono/Consolas on Windows, and DejaVu Sans Mono

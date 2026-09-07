@@ -73,6 +73,10 @@ enum WorkerRequest {
         terminal_session_id: TerminalSessionId,
         input: ghostty::ScrollInput,
     },
+    ScrollViewport {
+        terminal_session_id: TerminalSessionId,
+        delta: isize,
+    },
     Selection {
         terminal_session_id: TerminalSessionId,
         input: ghostty::SelectionInput,
@@ -271,6 +275,17 @@ impl ApplicationCore {
         })
     }
 
+    pub(crate) fn scroll_viewport(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        delta: isize,
+    ) -> Result<(), String> {
+        self.expect_ack(WorkerRequest::ScrollViewport {
+            terminal_session_id,
+            delta,
+        })
+    }
+
     pub(crate) fn selection_event(
         &self,
         terminal_session_id: TerminalSessionId,
@@ -455,6 +470,22 @@ fn run_terminal_runtime(
                     } => {
                         if runtime.contains_terminal(terminal_session_id) {
                             let result = runtime.scroll(terminal_session_id, input);
+                            if result.as_ref().copied().unwrap_or(true)
+                                && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
+                            {
+                                changed_terminals.push((terminal_session_id, revision));
+                            }
+                            result.map(|_| WorkerResponse::Ack)
+                        } else {
+                            Ok(WorkerResponse::Ack)
+                        }
+                    }
+                    WorkerRequest::ScrollViewport {
+                        terminal_session_id,
+                        delta,
+                    } => {
+                        if runtime.contains_terminal(terminal_session_id) {
+                            let result = runtime.scroll_viewport(terminal_session_id, delta);
                             if result.as_ref().copied().unwrap_or(true)
                                 && let Ok(revision) = runtime.terminal_revision(terminal_session_id)
                             {

@@ -22,16 +22,114 @@ pub(crate) enum KeybindAction {
     ClosePane,
     SplitHorizontal,
     SplitVertical,
+    NextTab,
+    PreviousTab,
+    NextSpace,
+    PreviousSpace,
+    CloseTab,
+    CloseSpace,
+    ToggleSidebar,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    NextPane,
+    PreviousPane,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    IncreaseFont,
+    DecreaseFont,
+    ResetFont,
+    ScrollLineUp,
+    ScrollLineDown,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollTop,
+    ScrollBottom,
+    MovePane,
+    NextAgent,
+    PreviousAgent,
+    ToggleAgentList,
+    Quit,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectTab9,
+    SelectSpace1,
+    SelectSpace2,
+    SelectSpace3,
+    SelectSpace4,
+    SelectSpace5,
+    SelectSpace6,
+    SelectSpace7,
+    SelectSpace8,
+    SelectSpace9,
 }
 
 impl KeybindAction {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 55] = [
         Self::OpenSettings,
         Self::CreateSpace,
         Self::CreateTab,
         Self::ClosePane,
         Self::SplitHorizontal,
         Self::SplitVertical,
+        Self::NextTab,
+        Self::PreviousTab,
+        Self::NextSpace,
+        Self::PreviousSpace,
+        Self::CloseTab,
+        Self::CloseSpace,
+        Self::ToggleSidebar,
+        Self::FocusLeft,
+        Self::FocusRight,
+        Self::FocusUp,
+        Self::FocusDown,
+        Self::NextPane,
+        Self::PreviousPane,
+        Self::ResizeLeft,
+        Self::ResizeRight,
+        Self::ResizeUp,
+        Self::ResizeDown,
+        Self::IncreaseFont,
+        Self::DecreaseFont,
+        Self::ResetFont,
+        Self::ScrollLineUp,
+        Self::ScrollLineDown,
+        Self::ScrollPageUp,
+        Self::ScrollPageDown,
+        Self::ScrollTop,
+        Self::ScrollBottom,
+        Self::MovePane,
+        Self::NextAgent,
+        Self::PreviousAgent,
+        Self::ToggleAgentList,
+        Self::Quit,
+        Self::SelectTab1,
+        Self::SelectTab2,
+        Self::SelectTab3,
+        Self::SelectTab4,
+        Self::SelectTab5,
+        Self::SelectTab6,
+        Self::SelectTab7,
+        Self::SelectTab8,
+        Self::SelectTab9,
+        Self::SelectSpace1,
+        Self::SelectSpace2,
+        Self::SelectSpace3,
+        Self::SelectSpace4,
+        Self::SelectSpace5,
+        Self::SelectSpace6,
+        Self::SelectSpace7,
+        Self::SelectSpace8,
+        Self::SelectSpace9,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -42,6 +140,55 @@ impl KeybindAction {
             Self::ClosePane => "Close pane",
             Self::SplitHorizontal => "Split right",
             Self::SplitVertical => "Split down",
+            Self::NextTab => "Next Tab",
+            Self::PreviousTab => "Previous Tab",
+            Self::NextSpace => "Next Space",
+            Self::PreviousSpace => "Previous Space",
+            Self::CloseTab => "Close Tab",
+            Self::CloseSpace => "Close Space",
+            Self::ToggleSidebar => "Toggle sidebar",
+            Self::FocusLeft => "Focus Pane left",
+            Self::FocusRight => "Focus Pane right",
+            Self::FocusUp => "Focus Pane above",
+            Self::FocusDown => "Focus Pane below",
+            Self::NextPane => "Next Pane",
+            Self::PreviousPane => "Previous Pane",
+            Self::ResizeLeft => "Resize split left",
+            Self::ResizeRight => "Resize split right",
+            Self::ResizeUp => "Resize split up",
+            Self::ResizeDown => "Resize split down",
+            Self::IncreaseFont => "Increase font size",
+            Self::DecreaseFont => "Decrease font size",
+            Self::ResetFont => "Reset font size",
+            Self::ScrollLineUp => "Scroll line up",
+            Self::ScrollLineDown => "Scroll line down",
+            Self::ScrollPageUp => "Scroll page up",
+            Self::ScrollPageDown => "Scroll page down",
+            Self::ScrollTop => "Scroll to top",
+            Self::ScrollBottom => "Scroll to bottom",
+            Self::MovePane => "Move Pane",
+            Self::NextAgent => "Next agent",
+            Self::PreviousAgent => "Previous agent",
+            Self::ToggleAgentList => "Toggle agent list",
+            Self::Quit => "Quit Application",
+            Self::SelectTab1 => "Select Tab 1",
+            Self::SelectTab2 => "Select Tab 2",
+            Self::SelectTab3 => "Select Tab 3",
+            Self::SelectTab4 => "Select Tab 4",
+            Self::SelectTab5 => "Select Tab 5",
+            Self::SelectTab6 => "Select Tab 6",
+            Self::SelectTab7 => "Select Tab 7",
+            Self::SelectTab8 => "Select Tab 8",
+            Self::SelectTab9 => "Select Tab 9",
+            Self::SelectSpace1 => "Select Space 1",
+            Self::SelectSpace2 => "Select Space 2",
+            Self::SelectSpace3 => "Select Space 3",
+            Self::SelectSpace4 => "Select Space 4",
+            Self::SelectSpace5 => "Select Space 5",
+            Self::SelectSpace6 => "Select Space 6",
+            Self::SelectSpace7 => "Select Space 7",
+            Self::SelectSpace8 => "Select Space 8",
+            Self::SelectSpace9 => "Select Space 9",
         }
     }
 
@@ -53,6 +200,55 @@ impl KeybindAction {
             Self::ClosePane => "Close the focused pane",
             Self::SplitHorizontal => "Place a new pane to the right",
             Self::SplitVertical => "Place a new pane below",
+            Self::NextTab => "Select the next Tab",
+            Self::PreviousTab => "Select the previous Tab",
+            Self::NextSpace => "Select the next Space",
+            Self::PreviousSpace => "Select the previous Space",
+            Self::CloseTab => "Close every Pane in the selected Tab",
+            Self::CloseSpace => "Close every Tab in the selected Space",
+            Self::ToggleSidebar => "Show or hide the Space sidebar",
+            Self::FocusLeft => "Focus the nearest Pane to the left",
+            Self::FocusRight => "Focus the nearest Pane to the right",
+            Self::FocusUp => "Focus the nearest Pane above",
+            Self::FocusDown => "Focus the nearest Pane below",
+            Self::NextPane => "Cycle forward through Panes",
+            Self::PreviousPane => "Cycle backward through Panes",
+            Self::ResizeLeft => "Move the nearest vertical divider left",
+            Self::ResizeRight => "Move the nearest vertical divider right",
+            Self::ResizeUp => "Move the nearest horizontal divider up",
+            Self::ResizeDown => "Move the nearest horizontal divider down",
+            Self::IncreaseFont => "Increase terminal font size",
+            Self::DecreaseFont => "Decrease terminal font size",
+            Self::ResetFont => "Restore the default terminal font size",
+            Self::ScrollLineUp => "Scroll terminal history up one line",
+            Self::ScrollLineDown => "Scroll terminal history down one line",
+            Self::ScrollPageUp => "Scroll terminal history up one page",
+            Self::ScrollPageDown => "Scroll terminal history down one page",
+            Self::ScrollTop => "Show the oldest terminal history",
+            Self::ScrollBottom => "Return to live terminal output",
+            Self::MovePane => "Choose a destination Pane using the keyboard",
+            Self::NextAgent => "Focus the next agent terminal across Spaces",
+            Self::PreviousAgent => "Focus the previous agent terminal across Spaces",
+            Self::ToggleAgentList => "Expand or collapse agents in the selected Space",
+            Self::Quit => "Stop all Terminal Sessions and quit",
+            Self::SelectTab1 => "Select Tab 1 (9 selects the last)",
+            Self::SelectTab2 => "Select Tab 2 (9 selects the last)",
+            Self::SelectTab3 => "Select Tab 3 (9 selects the last)",
+            Self::SelectTab4 => "Select Tab 4 (9 selects the last)",
+            Self::SelectTab5 => "Select Tab 5 (9 selects the last)",
+            Self::SelectTab6 => "Select Tab 6 (9 selects the last)",
+            Self::SelectTab7 => "Select Tab 7 (9 selects the last)",
+            Self::SelectTab8 => "Select Tab 8 (9 selects the last)",
+            Self::SelectTab9 => "Select Tab 9 (9 selects the last)",
+            Self::SelectSpace1 => "Select Space 1 (9 selects the last)",
+            Self::SelectSpace2 => "Select Space 2 (9 selects the last)",
+            Self::SelectSpace3 => "Select Space 3 (9 selects the last)",
+            Self::SelectSpace4 => "Select Space 4 (9 selects the last)",
+            Self::SelectSpace5 => "Select Space 5 (9 selects the last)",
+            Self::SelectSpace6 => "Select Space 6 (9 selects the last)",
+            Self::SelectSpace7 => "Select Space 7 (9 selects the last)",
+            Self::SelectSpace8 => "Select Space 8 (9 selects the last)",
+            Self::SelectSpace9 => "Select Space 9 (9 selects the last)",
         }
     }
 }
@@ -125,12 +321,8 @@ fn display_key(key: &str) -> String {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct KeybindingSettings {
-    open_settings: Option<Shortcut>,
-    create_space: Option<Shortcut>,
-    create_tab: Option<Shortcut>,
-    close_pane: Option<Shortcut>,
-    split_horizontal: Option<Shortcut>,
-    split_vertical: Option<Shortcut>,
+    #[serde(flatten)]
+    bindings: std::collections::BTreeMap<KeybindAction, Option<Shortcut>>,
 }
 
 impl KeybindingSettings {
@@ -141,25 +333,15 @@ impl KeybindingSettings {
     }
 
     pub(crate) fn custom(&self, action: KeybindAction) -> Option<&Shortcut> {
-        match action {
-            KeybindAction::OpenSettings => self.open_settings.as_ref(),
-            KeybindAction::CreateSpace => self.create_space.as_ref(),
-            KeybindAction::CreateTab => self.create_tab.as_ref(),
-            KeybindAction::ClosePane => self.close_pane.as_ref(),
-            KeybindAction::SplitHorizontal => self.split_horizontal.as_ref(),
-            KeybindAction::SplitVertical => self.split_vertical.as_ref(),
-        }
+        self.bindings.get(&action).and_then(Option::as_ref)
     }
 
     pub(crate) fn set(&mut self, action: KeybindAction, shortcut: Option<Shortcut>) {
-        *match action {
-            KeybindAction::OpenSettings => &mut self.open_settings,
-            KeybindAction::CreateSpace => &mut self.create_space,
-            KeybindAction::CreateTab => &mut self.create_tab,
-            KeybindAction::ClosePane => &mut self.close_pane,
-            KeybindAction::SplitHorizontal => &mut self.split_horizontal,
-            KeybindAction::SplitVertical => &mut self.split_vertical,
-        } = shortcut;
+        if shortcut.is_some() {
+            self.bindings.insert(action, shortcut);
+        } else {
+            self.bindings.remove(&action);
+        }
     }
 
     pub(crate) fn conflict_for(
@@ -420,7 +602,10 @@ pub(crate) fn adjust_font_size(font_size: f32, delta: f32) -> f32 {
 }
 
 pub(crate) fn default_shortcut(action: KeybindAction) -> Shortcut {
-    let macos = cfg!(target_os = "macos");
+    default_shortcut_for(action, cfg!(target_os = "macos"))
+}
+
+fn default_shortcut_for(action: KeybindAction, macos: bool) -> Shortcut {
     let mut shortcut = Shortcut {
         key: match action {
             KeybindAction::OpenSettings => ",",
@@ -429,6 +614,55 @@ pub(crate) fn default_shortcut(action: KeybindAction) -> Shortcut {
             KeybindAction::ClosePane => "w",
             KeybindAction::SplitHorizontal => "d",
             KeybindAction::SplitVertical => "e",
+            KeybindAction::NextTab => "tab",
+            KeybindAction::PreviousTab => "tab",
+            KeybindAction::NextSpace => "pagedown",
+            KeybindAction::PreviousSpace => "pageup",
+            KeybindAction::CloseTab => "w",
+            KeybindAction::CloseSpace => "w",
+            KeybindAction::ToggleSidebar => "b",
+            KeybindAction::FocusLeft => "left",
+            KeybindAction::FocusRight => "right",
+            KeybindAction::FocusUp => "up",
+            KeybindAction::FocusDown => "down",
+            KeybindAction::NextPane => "]",
+            KeybindAction::PreviousPane => "[",
+            KeybindAction::ResizeLeft => "left",
+            KeybindAction::ResizeRight => "right",
+            KeybindAction::ResizeUp => "up",
+            KeybindAction::ResizeDown => "down",
+            KeybindAction::IncreaseFont => "=",
+            KeybindAction::DecreaseFont => "-",
+            KeybindAction::ResetFont => "0",
+            KeybindAction::ScrollLineUp => "up",
+            KeybindAction::ScrollLineDown => "down",
+            KeybindAction::ScrollPageUp => "pageup",
+            KeybindAction::ScrollPageDown => "pagedown",
+            KeybindAction::ScrollTop => "home",
+            KeybindAction::ScrollBottom => "end",
+            KeybindAction::MovePane => "m",
+            KeybindAction::NextAgent => "u",
+            KeybindAction::PreviousAgent => "u",
+            KeybindAction::ToggleAgentList => ".",
+            KeybindAction::Quit => "q",
+            KeybindAction::SelectTab1 => "1",
+            KeybindAction::SelectTab2 => "2",
+            KeybindAction::SelectTab3 => "3",
+            KeybindAction::SelectTab4 => "4",
+            KeybindAction::SelectTab5 => "5",
+            KeybindAction::SelectTab6 => "6",
+            KeybindAction::SelectTab7 => "7",
+            KeybindAction::SelectTab8 => "8",
+            KeybindAction::SelectTab9 => "9",
+            KeybindAction::SelectSpace1 => "1",
+            KeybindAction::SelectSpace2 => "2",
+            KeybindAction::SelectSpace3 => "3",
+            KeybindAction::SelectSpace4 => "4",
+            KeybindAction::SelectSpace5 => "5",
+            KeybindAction::SelectSpace6 => "6",
+            KeybindAction::SelectSpace7 => "7",
+            KeybindAction::SelectSpace8 => "8",
+            KeybindAction::SelectSpace9 => "9",
         }
         .to_owned(),
         control: !macos,
@@ -443,6 +677,61 @@ pub(crate) fn default_shortcut(action: KeybindAction) -> Shortcut {
             | KeybindAction::SplitHorizontal
             | KeybindAction::SplitVertical
     );
+    use KeybindAction::*;
+    match action {
+        NextTab | PreviousTab => {
+            shortcut.control = true;
+            shortcut.platform = false;
+            shortcut.shift = action == PreviousTab;
+        }
+        NextSpace | PreviousSpace => {
+            shortcut.alt = true;
+        }
+        CloseTab => {
+            shortcut.alt = true;
+            shortcut.shift = true;
+        }
+        CloseSpace => {
+            shortcut.alt = true;
+        }
+        FocusLeft | FocusRight | FocusUp | FocusDown => {
+            shortcut.alt = true;
+        }
+        ResizeLeft | ResizeRight | ResizeUp | ResizeDown => {
+            shortcut.alt = true;
+            shortcut.shift = true;
+        }
+        ScrollPageUp | ScrollPageDown | ScrollTop | ScrollBottom => {
+            shortcut.control = false;
+            shortcut.platform = false;
+            shortcut.shift = true;
+        }
+        ToggleSidebar | NextPane | PreviousPane | ScrollLineUp | ScrollLineDown | MovePane
+        | NextAgent | ToggleAgentList => {
+            shortcut.shift = true;
+        }
+        PreviousAgent => {
+            shortcut.shift = true;
+            shortcut.alt = true;
+        }
+        Quit => {
+            shortcut.shift = !macos;
+        }
+        SelectTab1 | SelectTab2 | SelectTab3 | SelectTab4 | SelectTab5 | SelectTab6
+        | SelectTab7 | SelectTab8 | SelectTab9 => {
+            shortcut.control = false;
+            shortcut.platform = macos;
+            shortcut.alt = !macos;
+        }
+        SelectSpace1 | SelectSpace2 | SelectSpace3 | SelectSpace4 | SelectSpace5 | SelectSpace6
+        | SelectSpace7 | SelectSpace8 | SelectSpace9 => {
+            shortcut.control = false;
+            shortcut.platform = macos;
+            shortcut.alt = !macos;
+            shortcut.shift = true;
+        }
+        _ => {}
+    }
     shortcut
 }
 
@@ -525,6 +814,47 @@ fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_defaults_are_unique_on_each_platform() {
+        for macos in [false, true] {
+            for (index, action) in KeybindAction::ALL.into_iter().enumerate() {
+                let binding = default_shortcut_for(action, macos);
+                assert!(binding.is_usable());
+                for other in &KeybindAction::ALL[index + 1..] {
+                    assert_ne!(
+                        binding,
+                        default_shortcut_for(*other, macos),
+                        "{action:?} conflicts with {other:?} (macOS={macos})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_settings_preserve_legacy_bindings_and_round_trip_new_ones() {
+        let mut settings: KeybindingSettings =
+            serde_json::from_str(r#"{"create_tab":{"key":"k","control":true},"close_pane":null}"#)
+                .unwrap();
+        assert_eq!(settings.get(KeybindAction::CreateTab).key, "k");
+        assert_eq!(
+            settings.get(KeybindAction::ClosePane),
+            default_shortcut(KeybindAction::ClosePane)
+        );
+        let custom = Shortcut {
+            key: "f8".into(),
+            control: false,
+            alt: false,
+            shift: false,
+            platform: false,
+        };
+        settings.set(KeybindAction::NextSpace, Some(custom.clone()));
+        let decoded: KeybindingSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.get(KeybindAction::NextSpace), custom);
+        assert_eq!(decoded.get(KeybindAction::CreateTab).key, "k");
+    }
 
     #[test]
     fn defaults_round_trip_and_missing_fields_are_filled() {

@@ -257,6 +257,12 @@ impl TerminalSession {
         Ok(changed)
     }
 
+    pub(crate) fn scroll_viewport(&mut self, delta: isize) -> Result<bool, String> {
+        self.process.synchronize_reader()?;
+        let changed = self.drain_until_reader_synchronized()?;
+        Ok(self.terminal.scroll_viewport(delta)? || changed)
+    }
+
     pub(crate) fn selection_event(
         &mut self,
         input: ghostty::SelectionInput,
@@ -1265,6 +1271,32 @@ mod tests {
             "scroll routing must observe preceding alternate-screen mode changes"
         );
         assert!(!*resumed.lock().expect("resume marker mutex poisoned"));
+    }
+
+    #[test]
+    fn keyboard_scrollback_never_writes_input_to_the_process() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let resumed = Arc::new(Mutex::new(false));
+        let (output_tx, output_rx) = flume::unbounded();
+        let mut session = TerminalSession {
+            terminal: ghostty::Terminal::new(size.cols, size.rows).unwrap(),
+            process: Box::new(OutputBeforeCommand {
+                output: output_tx,
+                output_before_pause: b"\x1b[?1049h\x1b[?1000h\x1b[?1006h".to_vec(),
+                bytes: Arc::clone(&bytes),
+                resumed: Arc::clone(&resumed),
+                fail_write: false,
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: Vec::new(),
+        };
+        for delta in [isize::MIN, -1, 1, isize::MAX] {
+            session.scroll_viewport(delta).unwrap();
+        }
+        assert!(bytes.lock().unwrap().is_empty());
+        assert!(!*resumed.lock().unwrap());
     }
 
     #[test]
