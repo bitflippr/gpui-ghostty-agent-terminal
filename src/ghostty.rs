@@ -160,6 +160,11 @@ unsafe extern "C" {
         output_written: *mut usize,
         viewport_changed: *mut bool,
     ) -> i32;
+    fn spike_terminal_scroll_viewport(
+        terminal: *mut c_void,
+        delta: isize,
+        changed: *mut bool,
+    ) -> i32;
     fn spike_terminal_scroll_to_bottom(terminal: *mut c_void, changed: *mut bool) -> i32;
     fn spike_terminal_selection_event(
         terminal: *mut c_void,
@@ -538,6 +543,15 @@ impl Terminal {
             viewport_changed,
             input: output,
         })
+    }
+
+    /// Scroll history without encoding input for the child process. MIN/MAX select top/bottom.
+    pub(crate) fn scroll_viewport(&mut self, delta: isize) -> Result<bool, String> {
+        let mut changed = false;
+        let result =
+            unsafe { spike_terminal_scroll_viewport(self.raw.as_ptr(), delta, &mut changed) };
+        result_ok(result, "scroll terminal viewport")?;
+        Ok(changed)
     }
 
     pub(crate) fn scroll_to_bottom(&mut self) -> Result<bool, String> {
@@ -948,6 +962,28 @@ mod tests {
         assert!(terminal.scroll_to_bottom().expect("scroll bottom"));
         let bottom = terminal.snapshot().expect("snapshot restored bottom");
         assert!(super::snapshot_text(&bottom).contains("five"));
+    }
+
+    #[test]
+    fn keyboard_viewport_scrolling_ignores_mouse_tracking_and_preserves_alternate_screen() {
+        let mut terminal = Terminal::new(8, 3).unwrap();
+        terminal
+            .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[?1000h\x1b[?1006h")
+            .unwrap();
+        assert!(terminal.scroll_viewport(isize::MIN).unwrap());
+        assert!(super::snapshot_text(&terminal.snapshot().unwrap()).contains("one"));
+        assert!(terminal.scroll_viewport(1).unwrap());
+        assert!(super::snapshot_text(&terminal.snapshot().unwrap()).contains("two"));
+        assert!(terminal.scroll_viewport(isize::MAX).unwrap());
+        assert!(super::snapshot_text(&terminal.snapshot().unwrap()).contains("five"));
+        terminal.feed(b"\x1b[?1049hALT").unwrap();
+        let before = super::snapshot_text(&terminal.snapshot().unwrap());
+        for delta in [isize::MIN, -1, 1, isize::MAX] {
+            terminal.scroll_viewport(delta).unwrap();
+            assert_eq!(super::snapshot_text(&terminal.snapshot().unwrap()), before);
+        }
+        terminal.feed(b"\x1b[?1049l").unwrap();
+        assert!(super::snapshot_text(&terminal.snapshot().unwrap()).contains("five"));
     }
 
     #[test]

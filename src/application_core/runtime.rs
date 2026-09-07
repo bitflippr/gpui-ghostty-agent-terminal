@@ -271,6 +271,35 @@ impl CoreRuntime {
         }
     }
 
+    pub(super) fn scroll_viewport(
+        &mut self,
+        terminal_session_id: TerminalSessionId,
+        delta: isize,
+    ) -> Result<bool, String> {
+        let runtime = self.runtime_terminal_mut(terminal_session_id)?;
+        let session = runtime
+            .session
+            .as_mut()
+            .ok_or_else(|| lifecycle_error(&runtime.lifecycle))?;
+        let result = session.scroll_viewport(delta);
+        match result {
+            Ok(changed) => {
+                if changed {
+                    runtime.revision = runtime.revision.saturating_add(1);
+                    runtime.last_snapshot_revision = None;
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                // The ordered reader barrier may have fed terminal output even
+                // when scroll encoding, writing, or resuming subsequently failed.
+                runtime.revision = runtime.revision.saturating_add(1);
+                runtime.last_snapshot_revision = None;
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn selection_event(
         &mut self,
         terminal_session_id: TerminalSessionId,

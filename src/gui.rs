@@ -102,6 +102,7 @@ pub(crate) fn open_terminal_window(
                 terminal_bounds: Arc::new(Mutex::new(HashMap::new())),
                 terminal_selection_drag: None,
                 move_source: None,
+                move_target: None,
                 selections_after_commands: HashMap::new(),
                 sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
                 sidebar_dragging: false,
@@ -154,6 +155,7 @@ struct MultiplexerView {
     terminal_bounds: Arc<Mutex<HashMap<PaneId, Bounds<Pixels>>>>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     move_source: Option<PaneId>,
+    move_target: Option<PaneId>,
     selections_after_commands: HashMap<u64, PaneId>,
     sidebar_width: f32,
     sidebar_dragging: bool,
@@ -784,7 +786,12 @@ impl MultiplexerView {
                 command_id,
                 outcome,
             } => {
-                if let Some(split_id) = self.pending_split_resizes.remove(&command_id) {
+                if let Some(split_id) = self.pending_split_resizes.remove(&command_id)
+                    && !self
+                        .pending_split_resizes
+                        .values()
+                        .any(|pending| *pending == split_id)
+                {
                     self.preview_split_ratios.remove(&split_id);
                 }
                 self.selection = self
@@ -798,7 +805,12 @@ impl MultiplexerView {
             }
             DriverUpdate::CommandRejected { command_id, error } => {
                 self.selections_after_commands.remove(&command_id);
-                if let Some(split_id) = self.pending_split_resizes.remove(&command_id) {
+                if let Some(split_id) = self.pending_split_resizes.remove(&command_id)
+                    && !self
+                        .pending_split_resizes
+                        .values()
+                        .any(|pending| *pending == split_id)
+                {
                     self.preview_split_ratios.remove(&split_id);
                 }
                 self.global_error = Some(error);
@@ -970,7 +982,7 @@ impl MultiplexerView {
                 cx.notify();
             } else if event.keystroke.key.eq_ignore_ascii_case("backspace") {
                 self.reset_keybinding(action, cx);
-            } else if let Some(shortcut) = shortcut_from_keystroke(&event.keystroke) {
+            } else if let Some(shortcut) = shortcut_from_keystroke(&event.keystroke, cx) {
                 if let Some(conflict) = self.settings.keybindings.conflict_for(action, &shortcut) {
                     self.global_error = Some(format!(
                         "{} is already assigned to {}",
@@ -987,6 +999,49 @@ impl MultiplexerView {
             cx.stop_propagation();
             return;
         }
+        if !self.settings_open && self.move_source.is_some() {
+            if !self
+                .all_panes()
+                .iter()
+                .any(|(id, _, _)| Some(*id) == self.move_source)
+            {
+                self.cancel_move();
+            } else {
+                let key = event.keystroke.key.to_ascii_lowercase();
+                let ids: Vec<_> = self
+                    .all_panes()
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .filter(|id| Some(*id) != self.move_source)
+                    .collect();
+                match key.as_str() {
+                    "escape" => self.cancel_move(),
+                    "enter" => {
+                        if let Some(id) = self.move_target.filter(|id| ids.contains(id)) {
+                            if !self.flush_terminal_scrolls(cx) {
+                                cx.stop_propagation();
+                                return;
+                            }
+                            self.clear_terminal_selection();
+                            self.selection = selection_for_pane(id, &self.hierarchy);
+                            self.focus_pane(id, window, cx);
+                        }
+                    }
+                    "up" | "left" | "down" | "right" | "tab" => {
+                        self.move_target = cycle_item(
+                            &ids,
+                            self.move_target,
+                            matches!(key.as_str(), "up" | "left")
+                                || event.keystroke.modifiers.shift,
+                        );
+                    }
+                    _ => {}
+                }
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
         if self.settings_open && event.keystroke.key.eq_ignore_ascii_case("escape") {
             self.settings_open = false;
             self.focus.focus(window, cx);
@@ -999,15 +1054,42 @@ impl MultiplexerView {
             return;
         }
         if let Some(action) = KeybindAction::ALL.into_iter().find(|action| {
-            shortcut_matches(&self.settings.keybindings.get(*action), &event.keystroke)
+            shortcut_matches(
+                &self.settings.keybindings.get(*action),
+                &event.keystroke,
+                cx,
+            )
         }) {
             if action == KeybindAction::OpenSettings {
                 self.toggle_settings(window, cx);
-            } else if !self.settings_open {
+            } else if !self.settings_open
+                || matches!(
+                    action,
+                    KeybindAction::Quit
+                        | KeybindAction::IncreaseFont
+                        | KeybindAction::DecreaseFont
+                        | KeybindAction::ResetFont
+                )
+            {
                 self.perform_keybind_action(action, window, cx);
             }
             cx.stop_propagation();
             return;
+        }
+        if !self.settings_open
+            && self
+                .settings
+                .keybindings
+                .custom(KeybindAction::IncreaseFont)
+                .is_none()
+        {
+            let mut plus = crate::settings::default_shortcut(KeybindAction::IncreaseFont);
+            plus.key = "+".into();
+            if shortcut_matches(&plus, &event.keystroke, cx) {
+                self.perform_keybind_action(KeybindAction::IncreaseFont, window, cx);
+                cx.stop_propagation();
+                return;
+            }
         }
         if self.settings_open {
             return;
@@ -1070,18 +1152,245 @@ impl MultiplexerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use KeybindAction::*;
+        let direction = match action {
+            FocusLeft | ResizeLeft => Some(Direction::Left),
+            FocusRight | ResizeRight => Some(Direction::Right),
+            FocusUp | ResizeUp => Some(Direction::Up),
+            FocusDown | ResizeDown => Some(Direction::Down),
+            _ => None,
+        };
         match action {
-            KeybindAction::OpenSettings => unreachable!("settings is handled before dispatch"),
-            KeybindAction::CreateSpace => self.create_space(cx),
-            KeybindAction::CreateTab => self.create_tab(cx),
-            KeybindAction::ClosePane => {
-                if let Some(pane_id) = self.selection.pane_id {
-                    self.close_target(CloseTarget::Pane(pane_id), window, cx);
+            OpenSettings => self.toggle_settings(window, cx),
+            CreateSpace => self.create_space(cx),
+            CreateTab => self.create_tab(cx),
+            ClosePane => {
+                if let Some(id) = self.selection.pane_id {
+                    self.close_target(CloseTarget::Pane(id), window, cx);
                 }
             }
-            KeybindAction::SplitHorizontal => self.split_focused_pane(SplitAxis::Horizontal, cx),
-            KeybindAction::SplitVertical => self.split_focused_pane(SplitAxis::Vertical, cx),
+            CloseTab => {
+                if let Some(id) = self.selection.tab_id {
+                    self.close_target(CloseTarget::Tab(id), window, cx);
+                }
+            }
+            CloseSpace => {
+                if let Some(id) = self.selection.space_id {
+                    self.close_target(CloseTarget::Space(id), window, cx);
+                }
+            }
+            SplitHorizontal => self.split_focused_pane(SplitAxis::Horizontal, cx),
+            SplitVertical => self.split_focused_pane(SplitAxis::Vertical, cx),
+            NextTab | PreviousTab => {
+                if let Some(space) = self.selected_space() {
+                    let ids: Vec<_> = space.tabs.iter().map(|t| t.id).collect();
+                    if let Some(id) = cycle_item(&ids, self.selection.tab_id, action == PreviousTab)
+                    {
+                        self.select_tab(id, window, cx);
+                    }
+                }
+            }
+            NextSpace | PreviousSpace => {
+                let ids: Vec<_> = self.hierarchy.spaces.iter().map(|s| s.id).collect();
+                if let Some(id) = cycle_item(&ids, self.selection.space_id, action == PreviousSpace)
+                {
+                    self.select_space(id, window, cx);
+                }
+            }
+            NextPane | PreviousPane => {
+                let ids = self.visible_panes();
+                if let Some(id) = cycle_item(&ids, self.selection.pane_id, action == PreviousPane) {
+                    self.focus_pane(id, window, cx);
+                }
+            }
+            FocusLeft | FocusRight | FocusUp | FocusDown => {
+                let ids = self.visible_panes();
+                let target = self.selection.pane_id.and_then(|id| {
+                    let bounds = self
+                        .terminal_bounds
+                        .lock()
+                        .expect("terminal bounds mutex poisoned");
+                    adjacent_pane(id, &ids, &bounds, direction.unwrap())
+                });
+                if let Some(id) = target {
+                    self.focus_pane(id, window, cx);
+                }
+            }
+            ResizeLeft | ResizeRight | ResizeUp | ResizeDown => {
+                self.resize_split_keyboard(direction.unwrap(), cx)
+            }
+            ToggleSidebar => self.toggle_sidebar(cx),
+            IncreaseFont | DecreaseFont | ResetFont => {
+                let size = if action == ResetFont {
+                    AppSettings::default().font_size
+                } else {
+                    adjust_font_size(
+                        self.settings.font_size,
+                        if action == IncreaseFont { 1. } else { -1. },
+                    )
+                };
+                self.update_terminal_font(self.settings.font_family.clone(), size, cx);
+            }
+            ScrollLineUp | ScrollLineDown | ScrollPageUp | ScrollPageDown | ScrollTop
+            | ScrollBottom => {
+                if let Some(id) = self.focused_terminal_session_id() {
+                    let rows = self.terminals.get(&id).map_or(1, |t| t.rows) as isize;
+                    let delta = match action {
+                        ScrollLineUp => -1,
+                        ScrollLineDown => 1,
+                        ScrollPageUp => -rows,
+                        ScrollPageDown => rows,
+                        ScrollTop => isize::MIN,
+                        _ => isize::MAX,
+                    };
+                    if let Err(error) = self.driver.scroll_viewport(id, delta) {
+                        self.global_error = Some(error);
+                    }
+                    cx.notify();
+                }
+            }
+            MovePane => self.toggle_move_focused_pane(cx),
+            NextAgent | PreviousAgent => {
+                let ids: Vec<_> = self
+                    .all_panes()
+                    .into_iter()
+                    .filter(|(_, terminal, _)| {
+                        self.terminals
+                            .get(terminal)
+                            .is_some_and(|t| t.agent.is_some())
+                    })
+                    .map(|(id, _, _)| id)
+                    .collect();
+                if let Some(id) = cycle_item(&ids, self.selection.pane_id, action == PreviousAgent)
+                {
+                    self.clear_terminal_selection();
+                    self.selection = selection_for_pane(id, &self.hierarchy);
+                    self.focus_pane(id, window, cx);
+                }
+            }
+            ToggleAgentList => {
+                if let Some(id) = self.selection.space_id {
+                    self.toggle_agent_list(id, cx);
+                }
+            }
+            Quit => {
+                crate::application::handle_intent(crate::application::ApplicationIntent::Quit, cx)
+            }
+            _ => {
+                if let Some((space, index)) = numbered_action(action) {
+                    if space {
+                        if let Some(id) = numbered_item(
+                            &self
+                                .hierarchy
+                                .spaces
+                                .iter()
+                                .map(|s| s.id)
+                                .collect::<Vec<_>>(),
+                            index,
+                        ) {
+                            self.select_space(id, window, cx);
+                        }
+                    } else if let Some(space) = self.selected_space() {
+                        if let Some(id) = numbered_item(
+                            &space.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+                            index,
+                        ) {
+                            self.select_tab(id, window, cx);
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    fn visible_panes(&self) -> Vec<PaneId> {
+        let mut panes = Vec::new();
+        if let Some(tab) = self.selected_tab() {
+            collect_pane_terminals(&tab.layout, &mut panes);
+        }
+        panes.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn all_panes(&self) -> Vec<(PaneId, TerminalSessionId, String)> {
+        let mut result = Vec::new();
+        for space in &self.hierarchy.spaces {
+            for tab in &space.tabs {
+                let mut panes = Vec::new();
+                collect_pane_terminals(&tab.layout, &mut panes);
+                for (index, (id, terminal)) in panes.into_iter().enumerate() {
+                    result.push((
+                        id,
+                        terminal,
+                        format!(
+                            "{} / {} / Pane {}",
+                            space.name,
+                            self.tab_display_name(tab),
+                            index + 1
+                        ),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.sidebar_dragging = false;
+        self.requested_sizes.clear();
+        cx.notify();
+    }
+
+    fn resize_split_keyboard(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        if self.split_dragging.is_some() {
+            return;
+        }
+        let Some(pane) = self.selection.pane_id else {
+            return;
+        };
+        let Some(split_id) = self
+            .selected_tab()
+            .and_then(|tab| nearest_split(&tab.layout, pane, direction.axis()))
+        else {
+            return;
+        };
+        let Some(geometry) = self.split_geometries.get(&split_id).copied() else {
+            return;
+        };
+        let Some(ratio) = self
+            .preview_split_ratios
+            .get(&split_id)
+            .copied()
+            .or_else(|| {
+                self.selected_tab()
+                    .and_then(|tab| find_split_ratio(&tab.layout, split_id))
+            })
+        else {
+            return;
+        };
+        let current = projected_split_extent(
+            geometry.length,
+            ratio.parts_per_thousand() as f32 / 1000.,
+            geometry.cell_step,
+        );
+        let pointer = geometry.start + current + direction.sign() * geometry.cell_step;
+        let next = split_ratio_at(geometry, pointer);
+        if next == ratio {
+            return;
+        }
+        self.preview_split_ratios.insert(split_id, next);
+        if let Some(command_id) = self.submit_core_command(
+            CoreCommand::ResizeSplit {
+                split_id,
+                ratio: next,
+            },
+            cx,
+        ) {
+            self.pending_split_resizes.insert(command_id, split_id);
+        } else {
+            self.preview_split_ratios.remove(&split_id);
+        }
+        cx.notify();
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -1502,7 +1811,7 @@ impl MultiplexerView {
         if let Some(source_pane_id) = self.move_source
             && source_pane_id != pane_id
         {
-            self.move_source = None;
+            self.cancel_move();
             self.selection.pane_id = Some(pane_id);
             if let Some(command_id) = self.submit_core_command(
                 CoreCommand::MovePane {
@@ -1594,10 +1903,16 @@ impl MultiplexerView {
             return;
         };
         self.move_source = (self.move_source != Some(pane_id)).then_some(pane_id);
+        self.move_target = self
+            .all_panes()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .find(|id| *id != pane_id);
         cx.notify();
     }
 
     fn cancel_move(&mut self) {
+        self.move_target = None;
         self.move_source = None;
     }
 
@@ -1946,6 +2261,31 @@ impl MultiplexerView {
             .into_any_element()
     }
 
+    fn toggle_agent_list(&mut self, space_id: SpaceId, cx: &mut Context<Self>) {
+        let transition = if self.expanded_agent_spaces.insert(space_id) {
+            AgentLayoutTransition::Expanding
+        } else {
+            self.expanded_agent_spaces.remove(&space_id);
+            AgentLayoutTransition::Collapsing
+        };
+        self.agent_layout_transitions.insert(space_id, transition);
+        let timer = cx.background_executor().timer(Duration::from_millis(220));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, move |view, cx| {
+                if view.agent_layout_transitions.get(&space_id) == Some(&transition) {
+                    view.agent_layout_transitions.remove(&space_id);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn render_agent_summary(
         &self,
         space_id: SpaceId,
@@ -2004,28 +2344,7 @@ impl MultiplexerView {
             )
             .on_click(cx.listener(move |view, _event, _window, cx| {
                 cx.stop_propagation();
-                let transition = if view.expanded_agent_spaces.insert(space_id) {
-                    AgentLayoutTransition::Expanding
-                } else {
-                    view.expanded_agent_spaces.remove(&space_id);
-                    AgentLayoutTransition::Collapsing
-                };
-                view.agent_layout_transitions.insert(space_id, transition);
-                let timer = cx.background_executor().timer(Duration::from_millis(220));
-                cx.spawn(async move |this, cx| {
-                    timer.await;
-                    let Some(this) = this.upgrade() else {
-                        return;
-                    };
-                    this.update(cx, move |view, cx| {
-                        if view.agent_layout_transitions.get(&space_id) == Some(&transition) {
-                            view.agent_layout_transitions.remove(&space_id);
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-                cx.notify();
+                view.toggle_agent_list(space_id, cx);
             }))
             .when(!expanded, |this| this.child(icons))
             .child(count_label)
@@ -2209,10 +2528,7 @@ impl MultiplexerView {
             .cursor_pointer()
             .hover(|this| this.bg(self.shell.color(ShellColor::Hover)))
             .on_click(cx.listener(|view, _event, _window, cx| {
-                view.sidebar_collapsed = !view.sidebar_collapsed;
-                view.sidebar_dragging = false;
-                view.requested_sizes.clear();
-                cx.notify();
+                view.toggle_sidebar(cx);
             }))
             .child(
                 self.shell
@@ -3897,6 +4213,12 @@ impl Render for MultiplexerView {
                     )
                     .into_any_element()
             })
+            .when(self.move_source.is_some() && !self.settings_open, |this| {
+                let target = self.all_panes().into_iter().find(|(id, _, _)| Some(*id) == self.move_target).map(|(_, _, label)| label).unwrap_or_else(|| "No destination Pane available".into());
+                this.child(div().absolute().top(px(70.)).left(px(24.)).right(px(24.)).p_4().rounded_lg()
+                    .bg(self.shell.opaque_color(ShellColor::Selected)).text_color(self.shell.color(ShellColor::Text))
+                    .child(format!("Move Pane to: {target} | Arrows/Tab: choose | Enter: move right of destination | Esc: cancel")))
+            })
             .when_some(self.global_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -3912,6 +4234,136 @@ impl Render for MultiplexerView {
                 )
             })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+impl Direction {
+    fn axis(self) -> SplitAxis {
+        match self {
+            Self::Left | Self::Right => SplitAxis::Horizontal,
+            _ => SplitAxis::Vertical,
+        }
+    }
+    fn sign(self) -> f32 {
+        if matches!(self, Self::Left | Self::Up) {
+            -1.
+        } else {
+            1.
+        }
+    }
+}
+
+fn cycle_item<T: Copy + PartialEq>(ids: &[T], current: Option<T>, backwards: bool) -> Option<T> {
+    if ids.is_empty() {
+        return None;
+    }
+    let index = current.and_then(|id| ids.iter().position(|candidate| *candidate == id));
+    Some(
+        ids[match index {
+            Some(i) if backwards => (i + ids.len() - 1) % ids.len(),
+            Some(i) => (i + 1) % ids.len(),
+            None if backwards => ids.len() - 1,
+            None => 0,
+        }],
+    )
+}
+
+fn numbered_item<T: Copy>(ids: &[T], index: usize) -> Option<T> {
+    if index == 9 {
+        ids.last().copied()
+    } else {
+        ids.get(index.checked_sub(1)?).copied()
+    }
+}
+
+fn numbered_action(action: KeybindAction) -> Option<(bool, usize)> {
+    use KeybindAction::*;
+    match action {
+        SelectTab1 => Some((false, 1)),
+        SelectTab2 => Some((false, 2)),
+        SelectTab3 => Some((false, 3)),
+        SelectTab4 => Some((false, 4)),
+        SelectTab5 => Some((false, 5)),
+        SelectTab6 => Some((false, 6)),
+        SelectTab7 => Some((false, 7)),
+        SelectTab8 => Some((false, 8)),
+        SelectTab9 => Some((false, 9)),
+        SelectSpace1 => Some((true, 1)),
+        SelectSpace2 => Some((true, 2)),
+        SelectSpace3 => Some((true, 3)),
+        SelectSpace4 => Some((true, 4)),
+        SelectSpace5 => Some((true, 5)),
+        SelectSpace6 => Some((true, 6)),
+        SelectSpace7 => Some((true, 7)),
+        SelectSpace8 => Some((true, 8)),
+        SelectSpace9 => Some((true, 9)),
+        _ => None,
+    }
+}
+
+fn nearest_split(layout: &PaneLayout, pane: PaneId, axis: SplitAxis) -> Option<SplitId> {
+    let PaneLayout::Split(split) = layout else {
+        return None;
+    };
+    let child = if layout_contains_pane(&split.first, pane) {
+        &split.first
+    } else if layout_contains_pane(&split.second, pane) {
+        &split.second
+    } else {
+        return None;
+    };
+    nearest_split(child, pane, axis).or_else(|| (split.axis == axis).then_some(split.id))
+}
+
+fn adjacent_pane(
+    current: PaneId,
+    ids: &[PaneId],
+    bounds: &HashMap<PaneId, Bounds<Pixels>>,
+    direction: Direction,
+) -> Option<PaneId> {
+    let source = bounds.get(&current)?;
+    let horizontal = direction.axis() == SplitAxis::Horizontal;
+    let edges = |b: &Bounds<Pixels>| {
+        if horizontal {
+            (
+                b.origin.x.as_f32(),
+                b.origin.x.as_f32() + b.size.width.as_f32(),
+                b.origin.y.as_f32(),
+                b.origin.y.as_f32() + b.size.height.as_f32(),
+            )
+        } else {
+            (
+                b.origin.y.as_f32(),
+                b.origin.y.as_f32() + b.size.height.as_f32(),
+                b.origin.x.as_f32(),
+                b.origin.x.as_f32() + b.size.width.as_f32(),
+            )
+        }
+    };
+    let (start, end, cross_start, cross_end) = edges(source);
+    ids.iter()
+        .copied()
+        .filter(|id| *id != current)
+        .filter_map(|id| {
+            let (a, b, c, d) = edges(bounds.get(&id)?);
+            let gap = if direction.sign() < 0. {
+                start - b
+            } else {
+                a - end
+            };
+            if gap < -1. || c >= cross_end || d <= cross_start {
+                return None;
+            }
+            Some((id, gap.max(0.), ((c + d) - (cross_start + cross_end)).abs()))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+        .map(|(id, _, _)| id)
 }
 
 fn selection_for_created(
@@ -4255,25 +4707,45 @@ fn pane_close_shortcut_for(key: &Keystroke, platform: PasteShortcutPlatform) -> 
     }
 }
 
-fn shortcut_matches(shortcut: &Shortcut, key: &Keystroke) -> bool {
-    shortcut.key.eq_ignore_ascii_case(&key.key)
-        && shortcut.control == key.modifiers.control
-        && shortcut.alt == key.modifiers.alt
-        && shortcut.shift == key.modifiers.shift
-        && shortcut.platform == key.modifiers.platform
-        && !key.modifiers.function
+fn shortcut_keystroke(shortcut: &Shortcut) -> Keystroke {
+    Keystroke {
+        key: shortcut.key.to_ascii_lowercase(),
+        key_char: None,
+        modifiers: gpui::Modifiers {
+            control: shortcut.control,
+            alt: shortcut.alt,
+            shift: shortcut.shift,
+            platform: shortcut.platform,
+            function: false,
+        },
+    }
 }
 
-fn shortcut_from_keystroke(key: &Keystroke) -> Option<Shortcut> {
+fn shortcut_matches(shortcut: &Shortcut, key: &Keystroke, cx: &App) -> bool {
+    let target = gpui::KeybindingKeystroke::new_with_mapper(
+        shortcut_keystroke(shortcut),
+        false,
+        cx.keyboard_mapper().as_ref(),
+    );
+    key.should_match(&target)
+}
+
+fn shortcut_from_keystroke(key: &Keystroke, cx: &App) -> Option<Shortcut> {
     if key.modifiers.function {
         return None;
     }
+    let mapped = gpui::KeybindingKeystroke::new_with_mapper(
+        key.clone(),
+        false,
+        cx.keyboard_mapper().as_ref(),
+    );
+    let modifiers = mapped.modifiers();
     let shortcut = Shortcut {
-        key: key.key.to_string(),
-        control: key.modifiers.control,
-        alt: key.modifiers.alt,
-        shift: key.modifiers.shift,
-        platform: key.modifiers.platform,
+        key: mapped.key().to_ascii_lowercase(),
+        control: modifiers.control,
+        alt: modifiers.alt,
+        shift: modifiers.shift,
+        platform: modifiers.platform,
     };
     shortcut.is_usable().then_some(shortcut)
 }
@@ -4930,6 +5402,130 @@ mod tests {
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn keyboard_navigation_wraps_and_handles_empty_or_missing_selection() {
+        assert_eq!(super::cycle_item(&[1, 2, 3], Some(3), false), Some(1));
+        assert_eq!(super::cycle_item(&[1, 2, 3], Some(1), true), Some(3));
+        assert_eq!(super::cycle_item(&[1, 2, 3], Some(99), false), Some(1));
+        assert_eq!(super::cycle_item(&[1, 2, 3], None, true), Some(3));
+        assert_eq!(super::cycle_item::<u8>(&[], None, false), None);
+        assert_eq!(super::numbered_item(&[1, 2, 3], 9), Some(3));
+        assert_eq!(super::numbered_item(&[1, 2, 3], 4), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keyboard_windows_mapper_round_trips_shifted_shortcuts_without_collisions() {
+        use crate::settings::{KeybindAction, default_shortcut};
+        let platform = gpui_platform::current_platform(true);
+        let mapper = platform.keyboard_mapper();
+        let bindings: Vec<_> = KeybindAction::ALL
+            .into_iter()
+            .map(|action| {
+                let binding = gpui::KeybindingKeystroke::new_with_mapper(
+                    super::shortcut_keystroke(&default_shortcut(action)),
+                    false,
+                    mapper.as_ref(),
+                );
+                (action, binding)
+            })
+            .collect();
+        for (index, (action, binding)) in bindings.iter().enumerate() {
+            for (other, other_binding) in &bindings[index + 1..] {
+                assert!(
+                    !binding.inner().should_match(other_binding),
+                    "{action:?} conflicts with {other:?}"
+                );
+            }
+            // Recording must preserve the physical chord even though Windows events
+            // contain a shifted character and no Shift modifier for punctuation.
+            let recorded = gpui::KeybindingKeystroke::new_with_mapper(
+                binding.inner().clone(),
+                false,
+                mapper.as_ref(),
+            );
+            assert_eq!(recorded.key(), binding.key());
+            assert_eq!(recorded.modifiers(), binding.modifiers());
+        }
+    }
+
+    #[test]
+    fn keyboard_directional_focus_uses_visible_geometry_not_tree_order() {
+        use super::Direction;
+        use gpui::{Bounds, point, px, size};
+        let ids: Vec<_> = (1..=5).map(PaneId::from_u64).collect();
+        let rect = |x, y, w, h| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+        let bounds = HashMap::from([
+            (ids[0], rect(0., 0., 100., 205.)),
+            (ids[1], rect(105., 0., 100., 100.)),
+            (ids[2], rect(105., 105., 100., 100.)),
+            (ids[3], rect(210., 0., 100., 205.)),
+            // A stale bound from another Tab must never receive focus.
+            (ids[4], rect(102., 0., 1., 205.)),
+        ]);
+        let visible = &ids[..4];
+        assert_eq!(
+            super::adjacent_pane(ids[0], visible, &bounds, Direction::Right),
+            Some(ids[1])
+        );
+        assert_eq!(
+            super::adjacent_pane(ids[2], visible, &bounds, Direction::Up),
+            Some(ids[1])
+        );
+        assert_eq!(
+            super::adjacent_pane(ids[1], visible, &bounds, Direction::Left),
+            Some(ids[0])
+        );
+        assert_eq!(
+            super::adjacent_pane(ids[0], visible, &bounds, Direction::Left),
+            None
+        );
+        assert_eq!(
+            super::adjacent_pane(ids[2], visible, &bounds, Direction::Right),
+            Some(ids[3])
+        );
+    }
+
+    #[test]
+    fn keyboard_resize_selects_the_nearest_ancestor_with_the_matching_axis() {
+        use crate::{PaneSnapshot, SplitId, SplitSnapshot};
+        let leaf = |id| {
+            PaneLayout::Pane(PaneSnapshot {
+                id: PaneId::from_u64(id),
+                terminal_session_id: TerminalSessionId::from_u64(id),
+            })
+        };
+        let layout = PaneLayout::Split(SplitSnapshot {
+            id: SplitId::from_u64(1),
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(leaf(1)),
+            second: Box::new(PaneLayout::Split(SplitSnapshot {
+                id: SplitId::from_u64(2),
+                axis: SplitAxis::Vertical,
+                ratio: SplitRatio::EQUAL,
+                first: Box::new(leaf(2)),
+                second: Box::new(leaf(3)),
+            })),
+        });
+        assert_eq!(
+            super::nearest_split(&layout, PaneId::from_u64(3), SplitAxis::Horizontal),
+            Some(SplitId::from_u64(1))
+        );
+        assert_eq!(
+            super::nearest_split(&layout, PaneId::from_u64(3), SplitAxis::Vertical),
+            Some(SplitId::from_u64(2))
+        );
+        assert_eq!(
+            super::nearest_split(&layout, PaneId::from_u64(1), SplitAxis::Vertical),
+            None
+        );
+        assert_eq!(
+            super::nearest_split(&layout, PaneId::from_u64(99), SplitAxis::Horizontal),
+            None
+        );
+    }
 
     #[test]
     fn windows_page_scroll_sentinel_becomes_one_visible_page() {

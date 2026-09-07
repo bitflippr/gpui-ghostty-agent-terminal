@@ -408,6 +408,14 @@ static GhosttyResult scroll_viewport(SpikeTerminal* spike,
   return GHOSTTY_SUCCESS;
 }
 
+int spike_terminal_scroll_viewport(SpikeTerminal* spike, intptr_t delta, bool* changed) {
+  if (spike == NULL || changed == NULL) return GHOSTTY_INVALID_VALUE;
+  GhosttyTerminalScrollViewport behavior = {.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA, .value = {.delta = delta}};
+  if (delta == INTPTR_MIN) behavior.tag = GHOSTTY_SCROLL_VIEWPORT_TOP;
+  if (delta == INTPTR_MAX) behavior.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
+  return scroll_viewport(spike, behavior, changed);
+}
+
 int spike_terminal_scroll_to_bottom(SpikeTerminal* spike, bool* changed) {
   if (spike == NULL || changed == NULL) return GHOSTTY_INVALID_VALUE;
   return scroll_viewport(

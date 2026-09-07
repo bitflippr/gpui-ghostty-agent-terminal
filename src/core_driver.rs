@@ -233,6 +233,10 @@ enum Command {
         terminal_session_id: TerminalSessionId,
         input: crate::ghostty::ScrollInput,
     },
+    ScrollViewport {
+        terminal_session_id: TerminalSessionId,
+        delta: isize,
+    },
     Selection {
         terminal_session_id: TerminalSessionId,
         input: crate::ghostty::SelectionInput,
@@ -433,6 +437,17 @@ impl CoreDriver {
         })
     }
 
+    pub(crate) fn scroll_viewport(
+        &self,
+        terminal_session_id: TerminalSessionId,
+        delta: isize,
+    ) -> Result<(), String> {
+        self.send(Command::ScrollViewport {
+            terminal_session_id,
+            delta,
+        })
+    }
+
     pub(crate) fn selection_event(
         &self,
         terminal_session_id: TerminalSessionId,
@@ -557,6 +572,13 @@ fn run_driver(
                 input,
             })) => core
                 .scroll_terminal(terminal_session_id, input)
+                .map(|()| Vec::new())
+                .map_err(|error| error.to_string()),
+            DriverEvent::Command(Ok(Command::ScrollViewport {
+                terminal_session_id,
+                delta,
+            })) => core
+                .scroll_viewport(terminal_session_id, delta)
                 .map(|()| Vec::new())
                 .map_err(|error| error.to_string()),
             DriverEvent::Command(Ok(Command::Selection {

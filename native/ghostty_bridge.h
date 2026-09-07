@@ -103,6 +103,7 @@ int spike_terminal_scroll(SpikeTerminal* terminal, intptr_t delta_rows,
                           uint16_t modifiers, uint8_t* output,
                           size_t output_len, size_t* output_written,
                           bool* viewport_changed);
+int spike_terminal_scroll_viewport(SpikeTerminal* terminal, intptr_t delta, bool* changed);
 int spike_terminal_scroll_to_bottom(SpikeTerminal* terminal, bool* changed);
 int spike_terminal_selection_event(SpikeTerminal* terminal,
                                    const SpikeSelectionInput* input,
