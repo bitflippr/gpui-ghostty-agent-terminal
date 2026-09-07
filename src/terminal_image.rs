@@ -64,6 +64,173 @@ struct DecodedAnimation {
     frames: *mut DecodedFrame,
     frames_len: usize,
     loops: u32,
+    source: *mut c_void,
+    source_bytes: usize,
+    source_next: Option<unsafe extern "C" fn(*mut c_void, *const c_void, *mut DecodedFrame) -> i32>,
+    source_free: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+// The image crate's frame iterator is not Send. Construct and keep it on its
+// worker; only owned RGBA frames cross the channel. Two queued frames bound
+// decode-ahead work, and dropping the receiver cancels a blocked producer.
+struct DeferredFrames {
+    receiver: std::sync::mpsc::Receiver<Result<image::Frame, String>>,
+    #[cfg(test)]
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static IMAGE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct ImageWorkerPermit {
+    #[cfg(test)]
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for ImageWorkerPermit {
+    fn drop(&mut self) {
+        IMAGE_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(test)]
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn start_gif(bytes: &[u8]) -> Result<Option<(image::Frame, u32, DeferredFrames)>, String> {
+    use image::{AnimationDecoder, ImageDecoder};
+    use std::sync::{atomic::Ordering, mpsc};
+    let mut count = IMAGE_WORKERS.load(Ordering::Acquire);
+    loop {
+        if count >= 8 {
+            return Ok(None);
+        }
+        match IMAGE_WORKERS.compare_exchange_weak(
+            count,
+            count + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => count = actual,
+        }
+    }
+    #[cfg(test)]
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let permit = ImageWorkerPermit {
+        #[cfg(test)]
+        finished: Arc::clone(&finished),
+    };
+    let bytes = bytes.to_vec();
+    let (initial_tx, initial_rx) = mpsc::sync_channel(1);
+    let (tx, receiver) = mpsc::sync_channel(2);
+    std::thread::Builder::new()
+        .name("terminal-image-decoder".into())
+        .spawn(move || {
+            let _permit = permit;
+            let mut decoder = match image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+            {
+                Ok(decoder) => decoder,
+                Err(error) => {
+                    let _ = initial_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            if let Err(error) = decoder.set_limits(image_limits()) {
+                let _ = initial_tx.send(Err(error.to_string()));
+                return;
+            }
+            let loops = loop_count(decoder.loop_count());
+            let mut frames = decoder.into_frames();
+            let first = match frames.next() {
+                Some(Ok(frame)) => frame,
+                Some(Err(error)) => {
+                    let _ = initial_tx.send(Err(error.to_string()));
+                    return;
+                }
+                None => {
+                    let _ = initial_tx.send(Err("Empty animation".into()));
+                    return;
+                }
+            };
+            let dimensions = first.buffer().dimensions();
+            let mut total = first.buffer().len();
+            if total == 0 || total > 64 * 1024 * 1024 {
+                let _ = initial_tx.send(Err("Image exceeds storage limit".into()));
+                return;
+            }
+            if initial_tx.send(Ok((first, loops))).is_err() {
+                return;
+            }
+            for (index, frame) in frames.enumerate() {
+                let result = frame.map_err(|error| error.to_string()).and_then(|frame| {
+                    if index >= 4095
+                        || frame.buffer().dimensions() != dimensions
+                        || frame.buffer().len() > (256 * 1024 * 1024usize).saturating_sub(total)
+                    {
+                        return Err("Animation exceeds storage limit".into());
+                    }
+                    total += frame.buffer().len();
+                    Ok(frame)
+                });
+                let failed = result.is_err();
+                if tx.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let (first, loops) = initial_rx.recv().map_err(|error| error.to_string())??;
+    Ok(Some((
+        first,
+        loops,
+        DeferredFrames {
+            receiver,
+            #[cfg(test)]
+            finished,
+        },
+    )))
+}
+
+unsafe extern "C" fn next_deferred_frame(
+    source: *mut c_void,
+    allocator: *const c_void,
+    out: *mut DecodedFrame,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let source = unsafe { &*source.cast::<DeferredFrames>() };
+        match source.receiver.try_recv() {
+            Ok(Ok(frame)) => match copy_frame(allocator, &frame) {
+                Some(frame) => {
+                    unsafe { out.write(frame) };
+                    1
+                }
+                None => -1,
+            },
+            Ok(Err(_)) => -1,
+            Err(std::sync::mpsc::TryRecvError::Empty) => 0,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => 2,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+unsafe extern "C" fn free_deferred_frames(source: *mut c_void) {
+    drop(unsafe { Box::from_raw(source.cast::<DeferredFrames>()) });
+}
+
+fn copy_frame(allocator: *const c_void, frame: &image::Frame) -> Option<DecodedFrame> {
+    let rgba = frame.buffer();
+    let pixels = unsafe { ghostty_alloc(allocator, rgba.len()) };
+    if pixels.is_null() {
+        return None;
+    }
+    let (num, den) = frame.delay().numer_denom_ms();
+    let gap_ms = u64::from(num)
+        .div_ceil(u64::from(den).max(1))
+        .clamp(10, u64::from(u32::MAX)) as u32;
+    unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), pixels, rgba.len()) };
+    Some(DecodedFrame {
+        data: pixels,
+        data_len: rgba.len(),
+        gap_ms,
+    })
 }
 
 unsafe extern "C" {
@@ -121,7 +288,19 @@ unsafe extern "C" fn agent_decode_image(
             return false;
         }
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        let Ok((frames, loops)) = decode_frames(bytes) else {
+        let deferred = if image::guess_format(bytes).ok() == Some(image::ImageFormat::Gif) {
+            match start_gif(bytes) {
+                Ok(result) => result,
+                Err(_) => return false,
+            }
+        } else {
+            None
+        };
+        let (result, source) = match deferred {
+            Some((first, loops, source)) => (Ok((vec![first], loops)), Some(source)),
+            None => (decode_frames(bytes), None),
+        };
+        let Ok((frames, loops)) = result else {
             return false;
         };
         let Some(first) = frames.first() else {
@@ -166,6 +345,16 @@ unsafe extern "C" fn agent_decode_image(
                 frames: raw,
                 frames_len: frames.len(),
                 loops,
+                source_bytes: if source.is_some() {
+                    len + first.buffer().len() * 5
+                } else {
+                    0
+                },
+                source: source.map_or(std::ptr::null_mut(), |source| {
+                    Box::into_raw(Box::new(source)).cast()
+                }),
+                source_next: Some(next_deferred_frame),
+                source_free: Some(free_deferred_frames),
             });
         }
         true
@@ -230,10 +419,7 @@ fn collect_frames(
     loops: image::metadata::LoopCount,
     frames: image::Frames<'_>,
 ) -> Result<(Vec<image::Frame>, u32), String> {
-    let loops = match loops {
-        image::metadata::LoopCount::Infinite => 0,
-        image::metadata::LoopCount::Finite(n) => n.get(),
-    };
+    let loops = loop_count(loops);
     let mut result: Vec<image::Frame> = Vec::new();
     let mut total = 0usize;
     for frame in frames {
@@ -255,6 +441,13 @@ fn collect_frames(
         result.push(frame);
     }
     Ok((result, loops))
+}
+
+fn loop_count(loops: image::metadata::LoopCount) -> u32 {
+    match loops {
+        image::metadata::LoopCount::Infinite => 0,
+        image::metadata::LoopCount::Finite(n) => n.get(),
+    }
 }
 
 fn decode_image(
@@ -393,6 +586,78 @@ unsafe extern "C" fn collect(context: *mut c_void, raw: *const RawImage) {
 mod tests {
     use crate::ghostty::Terminal;
     use base64::Engine;
+
+    #[test]
+    fn deferred_gif_preserves_frames_and_cancels_decode_ahead() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            encoder
+                .set_repeat(image::codecs::gif::Repeat::Finite(3))
+                .unwrap();
+            encoder
+                .encode_frames((0..16).map(|index| {
+                    image::Frame::from_parts(
+                        image::RgbaImage::from_fn(32, 32, |x, y| {
+                            image::Rgba([
+                                if x < 16 { 255 } else { 0 },
+                                index * 16,
+                                0,
+                                if y < 16 && index % 2 == 0 { 0 } else { 255 },
+                            ])
+                        }),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(20 + u32::from(index) * 10, 1),
+                    )
+                }))
+                .unwrap();
+        }
+        let (expected, expected_loops) = super::decode_frames(&bytes).unwrap();
+        let (first, loops, source) = super::start_gif(&bytes).unwrap().unwrap();
+        assert_eq!(loops, expected_loops);
+        assert_eq!(first.buffer(), expected[0].buffer());
+        assert_eq!(first.delay(), expected[0].delay());
+        for frame in &expected[1..] {
+            let actual = source
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.buffer(), frame.buffer());
+            assert_eq!(actual.delay(), frame.delay());
+        }
+        assert!(matches!(
+            source
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(2)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        drop(source);
+
+        let (_, _, source) = super::start_gif(&bytes).unwrap().unwrap();
+        let finished = std::sync::Arc::clone(&source.finished);
+        drop(source); // The producer may be blocked on its bounded queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !finished.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoder survived cancellation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn tick_when_ready(terminal: &mut Terminal, now: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !terminal.tick_images(now).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "animation frame not ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 
     #[test]
     #[ignore = "requires IMAGE_PROTOCOL_TEST_FILE for a local decoder/VT timing run"]
@@ -586,11 +851,11 @@ mod tests {
         let first = terminal.snapshot().unwrap();
         assert_eq!(&first.images[0].rgba[..4], &[255, 0, 0, 255]);
         assert!(!terminal.tick_images(29).unwrap());
-        assert!(terminal.tick_images(30).unwrap());
+        tick_when_ready(&mut terminal, 30);
         let second = terminal.snapshot().unwrap();
         assert_eq!(&second.images[0].rgba[..4], &[0, 0, 255, 255]);
         assert_ne!(first.images[0].generation, second.images[0].generation);
-        assert!(terminal.tick_images(60).unwrap());
+        tick_when_ready(&mut terminal, 60);
         assert_eq!(
             &terminal.snapshot().unwrap().images[0].rgba[..4],
             &[255, 0, 0, 255]

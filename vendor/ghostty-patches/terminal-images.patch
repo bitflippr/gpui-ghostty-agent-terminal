@@ -39,10 +39,10 @@ index 9409ebc73..ceec28231 100644
  } GhosttyOscCommandType;
  
 diff --git a/include/ghostty/vt/sys.h b/include/ghostty/vt/sys.h
-index ae9059692..aebc69843 100644
+index ae9059692..8abbac341 100644
 --- a/include/ghostty/vt/sys.h
 +++ b/include/ghostty/vt/sys.h
-@@ -124,6 +124,18 @@ typedef bool (*GhosttySysDecodePngFn)(
+@@ -124,6 +124,27 @@ typedef bool (*GhosttySysDecodePngFn)(
      size_t data_len,
      GhosttySysImage* out);
  
@@ -55,13 +55,22 @@ index ae9059692..aebc69843 100644
 +    size_t frames_len;
 +    /** Zero loops forever; positive values are the total number of plays. */
 +    uint32_t loops;
++    /** Optional deferred decoder, owned by the library after success.
++     * next returns 0=pending, 1=owned frame, 2=end, -1=error, and never waits.
++     * source_bytes accounts for retained input and bounded decode-ahead buffers.
++     * free cancels and releases the source, including when an image is deleted.
++     * Both callbacks run serially with other operations on this terminal. */
++    void* source;
++    size_t source_bytes;
++    int32_t (*source_next)(void*, const GhosttyAllocator*, GhosttySysAnimationFrame*);
++    void (*source_free)(void*);
 +} GhosttySysAnimation;
 +typedef bool (*GhosttySysDecodeImageFn)(void*, const GhosttyAllocator*, const uint8_t*, size_t, GhosttySysAnimation*);
 +
  /**
   * System option identifiers for ghostty_sys_set().
   */
-@@ -165,6 +177,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
+@@ -165,6 +186,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
       * Input type: GhosttySysLogFn (function pointer, or NULL)
       */
      GHOSTTY_SYS_OPT_LOG = 2,
@@ -97,7 +106,7 @@ index b4a2722bf..78326ad1e 100644
          @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
          @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
 diff --git a/src/terminal/c/kitty_graphics.zig b/src/terminal/c/kitty_graphics.zig
-index 626cc7703..dba3b387f 100644
+index 626cc7703..625d4ed80 100644
 --- a/src/terminal/c/kitty_graphics.zig
 +++ b/src/terminal/c/kitty_graphics.zig
 @@ -546,6 +546,55 @@ pub const PlacementRenderInfo = extern struct {
@@ -111,8 +120,8 @@ index 626cc7703..dba3b387f 100644
 +    const output = out_changed orelse return .invalid_value;
 +    const t = wrapper.terminal;
 +    const animation = @import("../kitty/graphics_animation.zig");
-+    const primary = if (t.screens.get(.primary)) |screen| animation.tick(t.io(), &screen.kitty_images, now_ms) else false;
-+    const alternate = if (t.screens.get(.alternate)) |screen| animation.tick(t.io(), &screen.kitty_images, now_ms) else false;
++    const primary = if (t.screens.get(.primary)) |screen| animation.tick(t.io(), t.gpa(), &screen.kitty_images, now_ms) else false;
++    const alternate = if (t.screens.get(.alternate)) |screen| animation.tick(t.io(), t.gpa(), &screen.kitty_images, now_ms) else false;
 +    output.* = primary or alternate;
 +    return .success;
 +}
@@ -212,21 +221,31 @@ index 37dc57684..c9450d5a7 100644
  pub const modes = @import("modes.zig");
  pub const osc = @import("osc.zig");
 diff --git a/src/terminal/c/sys.zig b/src/terminal/c/sys.zig
-index 0cf0c6e3b..d56b2d4d3 100644
+index 0cf0c6e3b..1fb6e36fa 100644
 --- a/src/terminal/c/sys.zig
 +++ b/src/terminal/c/sys.zig
-@@ -22,6 +22,10 @@ pub const DecodePngFn = *const fn (
+@@ -22,6 +22,20 @@ pub const DecodePngFn = *const fn (
      *Image,
  ) callconv(lib.calling_conv) bool;
  
 +pub const AnimationFrame = extern struct { data: ?[*]u8, data_len: usize, gap_ms: u32 };
-+pub const Animation = extern struct { width: u32, height: u32, frames: ?[*]align(1) AnimationFrame, frames_len: usize, loops: u32 };
++pub const Animation = extern struct {
++    width: u32,
++    height: u32,
++    frames: ?[*]align(1) AnimationFrame,
++    frames_len: usize,
++    loops: u32,
++    source: ?*anyopaque = null,
++    source_bytes: usize = 0,
++    source_next: ?*const fn (*anyopaque, *const CAllocator, *AnimationFrame) callconv(lib.calling_conv) i32 = null,
++    source_free: ?*const fn (*anyopaque) callconv(lib.calling_conv) void = null,
++};
 +pub const DecodeImageFn = *const fn (?*anyopaque, *const CAllocator, [*]const u8, usize, *Animation) callconv(lib.calling_conv) bool;
 +
  /// C: GhosttySysLogLevel
  pub const LogLevel = enum(c_int) {
      @"error" = 0,
-@@ -54,11 +58,13 @@ pub const Option = enum(c_int) {
+@@ -54,11 +68,13 @@ pub const Option = enum(c_int) {
      userdata = 0,
      decode_png = 1,
      log = 2,
@@ -240,7 +259,7 @@ index 0cf0c6e3b..d56b2d4d3 100644
              .log => ?LogFn,
          };
      }
-@@ -69,6 +75,7 @@ pub const Option = enum(c_int) {
+@@ -69,6 +85,7 @@ pub const Option = enum(c_int) {
  const Global = struct {
      userdata: ?*anyopaque = null,
      decode_png: ?DecodePngFn = null,
@@ -248,7 +267,7 @@ index 0cf0c6e3b..d56b2d4d3 100644
      log: ?LogFn = null,
  };
  
-@@ -97,6 +104,31 @@ fn decodePngWrapper(
+@@ -97,6 +114,73 @@ fn decodePngWrapper(
      };
  }
  
@@ -257,6 +276,12 @@ index 0cf0c6e3b..d56b2d4d3 100644
 +    const c_alloc = CAllocator.fromZig(&alloc);
 +    var out: Animation = undefined;
 +    if (!func(global.userdata, &c_alloc, data.ptr, data.len, &out)) return error.InvalidData;
++    var own_source = true;
++    defer if (own_source) {
++        if (out.source) |source| {
++            if (out.source_free) |free| free(source);
++        }
++    };
 +    const raw = (out.frames orelse return error.InvalidData)[0..out.frames_len];
 +    defer alloc.free(raw);
 +    var own_pixels = true;
@@ -273,14 +298,50 @@ index 0cf0c6e3b..d56b2d4d3 100644
 +        if (source.data_len != expected) return error.InvalidData;
 +        dest.* = .{ .data = pixels[0..source.data_len], .gap_ms = source.gap_ms };
 +    }
++    var source: ?terminal_sys.Animation.Source = null;
++    if (out.source != null) {
++        if (out.source_next == null or out.source_free == null or out.source_bytes > 256 * 1024 * 1024) return error.InvalidData;
++        const held = try alloc.create(DeferredSource);
++        held.* = .{ .raw = out, .expected = expected };
++        source = .{ .context = held, .retained_bytes = out.source_bytes, .next = DeferredSource.next, .destroy = DeferredSource.destroy };
++    }
++    own_source = false;
 +    own_pixels = false;
-+    return .{ .width = out.width, .height = out.height, .frames = frames, .loops = out.loops };
++    return .{ .width = out.width, .height = out.height, .frames = frames, .loops = out.loops, .source = source };
 +}
++
++const DeferredSource = struct {
++    raw: Animation,
++    expected: usize,
++    fn next(alloc: std.mem.Allocator, context: *anyopaque) terminal_sys.DecodeError!terminal_sys.Animation.Source.Poll {
++        const self: *DeferredSource = @ptrCast(@alignCast(context));
++        const c_alloc = CAllocator.fromZig(&alloc);
++        var frame: AnimationFrame = undefined;
++        switch (self.raw.source_next.?(self.raw.source.?, &c_alloc, &frame)) {
++            0 => return .pending,
++            2 => return .done,
++            1 => {
++                const pixels = frame.data orelse return error.InvalidData;
++                if (frame.data_len != self.expected) {
++                    alloc.free(pixels[0..frame.data_len]);
++                    return error.InvalidData;
++                }
++                return .{ .frame = .{ .data = pixels[0..frame.data_len], .gap_ms = frame.gap_ms } };
++            },
++            else => return error.InvalidData,
++        }
++    }
++    fn destroy(alloc: std.mem.Allocator, context: *anyopaque) void {
++        const self: *DeferredSource = @ptrCast(@alignCast(context));
++        self.raw.source_free.?(self.raw.source.?);
++        alloc.destroy(self);
++    }
++};
 +
  pub fn set(
      option: Option,
      value: ?*const anyopaque,
-@@ -121,6 +153,10 @@ fn setTyped(
+@@ -121,6 +205,10 @@ fn setTyped(
  ) Result {
      switch (option) {
          .userdata => global.userdata = @constCast(value),
@@ -721,7 +782,7 @@ index e0756ccc7..56ed9c659 100644
      // Get our display settings
      const display_ = loading.display;
 diff --git a/src/terminal/kitty/graphics_image.zig b/src/terminal/kitty/graphics_image.zig
-index ef584c09a..8c1002e8a 100644
+index ef584c09a..a7efd3573 100644
 --- a/src/terminal/kitty/graphics_image.zig
 +++ b/src/terminal/kitty/graphics_image.zig
 @@ -33,6 +33,7 @@ pub const LoadingImage = struct {
@@ -877,12 +938,13 @@ index ef584c09a..8c1002e8a 100644
      pub fn deinit(self: *LoadingImage, alloc: Allocator) void {
          self.image.deinit(alloc);
          self.data.deinit(alloc);
-@@ -551,6 +603,13 @@ pub const Image = struct {
+@@ -551,6 +603,14 @@ pub const Image = struct {
      /// same (e.g. a retransmission of the same ID). Stamps order by
      /// transmission time. Zero means "never stored".
      generation: u64 = 0,
 +    transmission_generation: u64 = 0,
 +    frames: std.ArrayList(Frame) = .empty,
++    source: ?sys.Animation.Source = null,
 +    current_frame: usize = 0,
 +    animation: command.AnimationControl.AnimationAction = .stop,
 +    loops: u32 = 0,
@@ -891,7 +953,7 @@ index ef584c09a..8c1002e8a 100644
  
      /// Set this to true if this image was loaded by a command that
      /// doesn't specify an ID or number, since such commands should
-@@ -558,6 +617,38 @@ pub const Image = struct {
+@@ -558,6 +618,38 @@ pub const Image = struct {
      /// IDs in the public range (which is bad!).
      implicit_id: bool = false,
  
@@ -899,7 +961,7 @@ index ef584c09a..8c1002e8a 100644
 +
 +    pub fn byteSize(self: Image) usize {
 +        if (self.frames.items.len == 0) return self.data.len;
-+        var total: usize = 0;
++        var total: usize = if (self.source) |source| source.retained_bytes else 0;
 +        for (self.frames.items) |frame| total += frame.data.len;
 +        return total;
 +    }
@@ -930,11 +992,12 @@ index ef584c09a..8c1002e8a 100644
      pub const Error = error{
          InvalidData,
          DecompressionFailed,
-@@ -572,7 +663,10 @@ pub const Image = struct {
+@@ -572,7 +664,11 @@ pub const Image = struct {
      };
  
      pub fn deinit(self: *Image, alloc: Allocator) void {
 -        if (self.data.len > 0) alloc.free(self.data);
++        if (self.source) |source| source.deinit(alloc);
 +        if (self.frames.items.len != 0) {
 +            for (self.frames.items) |frame| alloc.free(frame.data);
 +        } else if (self.data.len > 0) alloc.free(self.data);
@@ -942,7 +1005,7 @@ index ef584c09a..8c1002e8a 100644
      }
  
      /// Mostly for logging
-@@ -628,9 +722,7 @@ test "image load with image too wide" {
+@@ -628,9 +724,7 @@ test "image load with image too wide" {
          .data = try alloc.dupe(u8, "AAAA"),
      };
      defer cmd.deinit(alloc);
@@ -953,7 +1016,7 @@ index ef584c09a..8c1002e8a 100644
  }
  
  test "image load with image too tall" {
-@@ -648,9 +740,7 @@ test "image load with image too tall" {
+@@ -648,9 +742,7 @@ test "image load with image too tall" {
          .data = try alloc.dupe(u8, "AAAA"),
      };
      defer cmd.deinit(alloc);
@@ -1847,7 +1910,7 @@ index dd1a6ce44..485502593 100644
          .columns = 1,
          .rows = 1,
 diff --git a/src/terminal/osc.zig b/src/terminal/osc.zig
-index 26ce12672..fe2f74977 100644
+index 26ce12672..72bd798c2 100644
 --- a/src/terminal/osc.zig
 +++ b/src/terminal/osc.zig
 @@ -162,6 +162,7 @@ pub const Command = union(Key) {
@@ -1874,7 +1937,34 @@ index 26ce12672..fe2f74977 100644
              => {},
          }
  
-@@ -551,6 +554,10 @@ pub const Parser = struct {
+@@ -542,6 +545,26 @@ pub const Parser = struct {
+         }
+     }
+ 
++    /// Consume bytes already classified as OSC data by the VT parser.
++    pub fn nextSlice(self: *Parser, input: []const u8) void {
++        var offset: usize = 0;
++        while (offset < input.len) : (offset += 1) {
++            if (self.state == .invalid) return;
++            if (self.capture) |*cap| {
++                const remaining = input[offset..];
++                if (self.state == .@"1337" and remaining.len > (96 * 1024 * 1024) -| cap.writer.buffered().len) {
++                    self.state = .invalid;
++                    return;
++                }
++                cap.writer.writeAll(remaining) catch {
++                    self.state = .invalid;
++                };
++                return;
++            }
++            self.next(input[offset]);
++        }
++    }
++
+     /// Consume the next character c and advance the parser state.
+     pub fn next(self: *Parser, c: u8) void {
+         // If the state becomes invalid for any reason, just discard
+@@ -551,6 +574,10 @@ pub const Parser = struct {
          // If a writer has been initialized, we just accumulate the rest of the
          // OSC sequence in the writer's buffer and skip the state machine.
          if (self.capture) |*cap| {
@@ -1885,7 +1975,7 @@ index 26ce12672..fe2f74977 100644
              cap.writer.writeByte(c) catch |err| switch (err) {
                  // We have overflowed our buffer or had some other error, set the
                  // state to invalid so that we discard any further input.
-@@ -730,7 +737,7 @@ pub const Parser = struct {
+@@ -730,7 +757,7 @@ pub const Parser = struct {
  
              .@"1337",
              => switch (c) {
@@ -1940,7 +2030,7 @@ index b05dd1b2a..2e2176396 100644
          .PopKeyLabels,
          .PushKeyLabels,
 diff --git a/src/terminal/stream.zig b/src/terminal/stream.zig
-index 791d0c55d..e452d25d2 100644
+index 791d0c55d..9492dcddc 100644
 --- a/src/terminal/stream.zig
 +++ b/src/terminal/stream.zig
 @@ -127,6 +127,7 @@ pub const Action = union(Key) {
@@ -1959,7 +2049,33 @@ index 791d0c55d..e452d25d2 100644
          },
      );
  
-@@ -2361,6 +2363,7 @@ pub fn Stream(comptime H: type) type {
+@@ -679,6 +681,25 @@ pub fn Stream(comptime H: type) type {
+                         if (self.parser.state != .csi_param) continue;
+                     }
+ 
++                    // OSC image payloads need the same bulk path as APC.
++                    // Leave controls and C1 bytes to the transition table.
++                    if (self.parser.state == .osc_string) {
++                        const rest = input[offset..];
++                        var end: usize = 0;
++                        if (comptime std.simd.suggestVectorLength(u8)) |n| {
++                            const V = @Vector(n, u8);
++                            while (end + n <= rest.len) {
++                                const bytes: V = rest[end..][0..n].*;
++                                if (@reduce(.Or, (bytes < @as(V, @splat(0x20))) | (bytes >= @as(V, @splat(0x80))))) break;
++                                end += n;
++                            }
++                        }
++                        while (end < rest.len and rest[end] >= 0x20 and rest[end] < 0x80) : (end += 1) {}
++                        self.parser.osc_parser.nextSlice(rest[0..end]);
++                        offset += end;
++                        if (offset >= input.len) return input.len;
++                    }
++
+                     // Bulk-consume APC string bytes into a single slice.
+                     // APC payloads (e.g. Kitty graphics) can be megabytes
+                     // of base64 data, so per-byte dispatch is far too slow.
+@@ -2361,6 +2382,7 @@ pub fn Stream(comptime H: type) type {
                  .kitty_color_protocol => |v| {
                      self.handler.vt(.kitty_color_report, v);
                  },
@@ -1967,6 +2083,57 @@ index 791d0c55d..e452d25d2 100644
  
                  .show_desktop_notification => |v| {
                      self.handler.vt(.show_desktop_notification, .{
+@@ -3887,6 +3909,50 @@ const ApcTestHandler = struct {
+     }
+ };
+ 
++test "stream: osc bulk preserves scalar controls and fragmentation" {
++    const H = struct {
++        hash: std.hash.Wyhash = .init(0),
++        commands: usize = 0,
++        pub fn deinit(_: *@This()) void {}
++        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
++            switch (action) {
++                .window_title => {
++                    self.hash.update(value.title);
++                    self.commands += 1;
++                },
++                .iterm_image => {
++                    self.hash.update(value.data.ptr[0..value.data.len]);
++                    self.commands += 1;
++                },
++                else => {},
++            }
++        }
++    };
++    for (0..256) |control| {
++        var input: std.ArrayList(u8) = .empty;
++        defer input.deinit(testing.allocator);
++        try input.appendSlice(testing.allocator, "\x1b]1337;File=inline=1:" ++ "AAAA" ** 64);
++        try input.append(testing.allocator, @intCast(control));
++        try input.appendSlice(testing.allocator, "BBBB" ** 64 ++ "\x1b\\\x1b]2;title after image\x07");
++        var scalar: Stream(H) = .initAlloc(testing.allocator, .{});
++        defer scalar.deinit();
++        for (input.items) |byte| scalar.next(byte);
++        for ([_]usize{ 7, input.items.len }) |chunk_len| {
++            var bulk: Stream(H) = .initAlloc(testing.allocator, .{});
++            defer bulk.deinit();
++            var offset: usize = 0;
++            while (offset < input.items.len) {
++                const end = @min(input.items.len, offset + chunk_len);
++                bulk.nextSlice(input.items[offset..end]);
++                offset = end;
++            }
++            try testing.expectEqual(scalar.handler.commands, bulk.handler.commands);
++            try testing.expectEqual(scalar.handler.hash.final(), bulk.handler.hash.final());
++            try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        }
++    }
++}
++
+ test "stream: apc bulk slice" {
+     var s: Stream(ApcTestHandler) = .init(.{});
+     s.nextSlice("\x1b_Gf=24,s=10,v=20;aGVsbG8=\x1b\\");
 diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
 index bbbe5f83e..46f161756 100644
 --- a/src/terminal/stream_terminal.zig
@@ -2015,10 +2182,10 @@ index bbbe5f83e..46f161756 100644
              .end_hyperlink => self.terminal.screens.active.endHyperlink(),
              .semantic_prompt => try self.terminal.semanticPrompt(value),
 diff --git a/src/terminal/sys.zig b/src/terminal/sys.zig
-index f0c64da50..612762cf0 100644
+index f0c64da50..30ccfafb6 100644
 --- a/src/terminal/sys.zig
 +++ b/src/terminal/sys.zig
-@@ -22,6 +22,26 @@ pub var decode_png: ?DecodePngFn = png: {
+@@ -22,6 +22,40 @@ pub var decode_png: ?DecodePngFn = png: {
  
  pub const DecodeError = Allocator.Error || error{InvalidData};
  pub const DecodePngFn = *const fn (Allocator, []const u8) DecodeError!Image;
@@ -2030,6 +2197,19 @@ index f0c64da50..612762cf0 100644
 +    height: u32,
 +    frames: []Frame,
 +    loops: u32 = 0,
++    source: ?Source = null,
++
++    /// A bounded decoder that produces later frames without blocking ticks.
++    pub const Source = struct {
++        context: *anyopaque,
++        retained_bytes: usize,
++        next: *const fn (Allocator, *anyopaque) DecodeError!Poll,
++        destroy: *const fn (Allocator, *anyopaque) void,
++        pub const Poll = union(enum) { pending, done, frame: Frame };
++        pub fn deinit(self: Source, alloc: Allocator) void {
++            self.destroy(alloc, self.context);
++        }
++    };
 +
 +    pub const Frame = struct {
 +        data: []u8,
@@ -2038,6 +2218,7 @@ index f0c64da50..612762cf0 100644
 +    };
 +
 +    pub fn deinit(self: Animation, alloc: Allocator) void {
++        if (self.source) |source| source.deinit(alloc);
 +        for (self.frames) |frame| alloc.free(frame.data);
 +        alloc.free(self.frames);
 +    }
@@ -2049,7 +2230,7 @@ diff --git a/src/terminal/iterm_image.zig b/src/terminal/iterm_image.zig
 new file mode 100644
 --- /dev/null
 +++ b/src/terminal/iterm_image.zig
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,188 @@
 +//! iTerm2 OSC 1337 inline images. Parsing and cursor/scrollback ownership stay
 +//! in the terminal; the embedder supplies the image decoder through sys.
 +const std = @import("std");
@@ -2224,7 +2405,8 @@ new file mode 100644
 +            .format = .rgba,
 +            .data = decoded.frames[0].data,
 +            .frames = .{ .items = decoded.frames, .capacity = decoded.frames.len },
-+            .animation = if (decoded.frames.len > 1) .run else .stop,
++            .source = decoded.source,
++            .animation = if (decoded.frames.len > 1 or decoded.source != null) .run else .stop,
 +            .loops = decoded.loops,
 +            .next_frame_ms = storage.now_ms +| decoded.frames[0].gap_ms,
 +        });
@@ -2241,7 +2423,7 @@ diff --git a/src/terminal/kitty/graphics_animation.zig b/src/terminal/kitty/grap
 new file mode 100644
 --- /dev/null
 +++ b/src/terminal/kitty/graphics_animation.zig
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,317 @@
 +//! Kitty animation canvases and playback, owned by terminal image storage.
 +const std = @import("std");
 +const Allocator = std.mem.Allocator;
@@ -2392,7 +2574,7 @@ new file mode 100644
 +        img.next_frame_ms = null;
 +        if (settings.action == .stop) img.completed_loops = 0;
 +    }
-+    _ = tickImage(io, storage, img, storage.now_ms);
++    _ = tickImage(io, alloc, storage, img, storage.now_ms);
 +    return .{ .id = img.id, .image_number = settings.image_number };
 +}
 +
@@ -2416,7 +2598,7 @@ new file mode 100644
 +    return .{ .id = img.id, .image_number = settings.image_number };
 +}
 +
-+fn tickImage(io: std.Io, storage: *Storage, img: *image.Image, now: u64) bool {
++fn tickImage(io: std.Io, alloc: Allocator, storage: *Storage, img: *image.Image, now: u64) bool {
 +    if (img.animation == .stop or img.frames.items.len == 0) return false;
 +    if (img.next_frame_ms == null) img.next_frame_ms = now +| img.frames.items[img.current_frame].gap_ms;
 +    var advanced = false;
@@ -2428,6 +2610,52 @@ new file mode 100644
 +            break;
 +        }
 +        var next = img.current_frame + 1;
++        if (next == img.frames.items.len) {
++            if (img.source) |source| {
++                const result = source.next(alloc, source.context) catch {
++                    storage.total_bytes -= source.retained_bytes;
++                    source.deinit(alloc);
++                    img.source = null;
++                    img.animation = .stop;
++                    img.next_frame_ms = null;
++                    break;
++                };
++                switch (result) {
++                    .pending => break,
++                    .done => {
++                        storage.total_bytes -= source.retained_bytes;
++                        source.deinit(alloc);
++                        img.source = null;
++                        if (img.frames.items.len == 1) {
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        }
++                    },
++                    .frame => |frame| {
++                        if (frame.data.len > storage.total_limit -| storage.total_bytes or img.frames.items.len >= 4096) {
++                            alloc.free(frame.data);
++                            storage.total_bytes -= source.retained_bytes;
++                            source.deinit(alloc);
++                            img.source = null;
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        }
++                        img.frames.append(alloc, frame) catch {
++                            alloc.free(frame.data);
++                            storage.total_bytes -= source.retained_bytes;
++                            source.deinit(alloc);
++                            img.source = null;
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        };
++                        storage.total_bytes += frame.data.len;
++                    },
++                }
++            }
++        }
 +        if (next == img.frames.items.len) {
 +            if (img.animation == .run_wait) break;
 +            img.completed_loops +|= 1;
@@ -2446,10 +2674,70 @@ new file mode 100644
 +    return advanced;
 +}
 +
-+pub fn tick(io: std.Io, storage: *Storage, now: u64) bool {
++pub fn tick(io: std.Io, alloc: Allocator, storage: *Storage, now: u64) bool {
 +    storage.now_ms = @max(storage.now_ms, now);
 +    var advanced = false;
 +    var iter = storage.images.valueIterator();
-+    while (iter.next()) |img| advanced = tickImage(io, storage, img, storage.now_ms) or advanced;
++    while (iter.next()) |img| advanced = tickImage(io, alloc, storage, img, storage.now_ms) or advanced;
 +    return advanced;
++}
++
++test "deferred animation accounts for frames and releases its source" {
++    const testing = std.testing;
++    const Source = @import("../sys.zig").Animation.Source;
++    const Context = struct {
++        polls: usize = 0,
++        frees: usize = 0,
++        fn next(alloc: Allocator, raw: *anyopaque) @import("../sys.zig").DecodeError!Source.Poll {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.polls += 1;
++            return switch (self.polls) {
++                1 => .pending,
++                2 => .{ .frame = .{ .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }), .gap_ms = 10 } },
++                else => .done,
++            };
++        }
++        fn destroy(_: Allocator, raw: *anyopaque) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.frees += 1;
++        }
++    };
++    var context: Context = .{};
++    var img: image.Image = .{ .width = 1, .height = 1, .format = .rgba, .animation = .run, .next_frame_ms = 10 };
++    defer img.deinit(testing.allocator);
++    try img.frames.append(testing.allocator, .{ .data = try testing.allocator.dupe(u8, &.{ 255, 0, 0, 255 }), .gap_ms = 10 });
++    img.selectFrame(0);
++    img.source = .{ .context = &context, .retained_bytes = 8, .next = Context.next, .destroy = Context.destroy };
++    var storage: Storage = .{ .total_limit = 64, .total_bytes = img.byteSize() };
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expectEqual(@as(usize, 12), storage.total_bytes);
++    try testing.expect(tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expectEqual(@as(usize, 16), storage.total_bytes);
++    try testing.expectEqual(@as(usize, 1), img.current_frame);
++    try testing.expect(tickImage(testing.io, testing.allocator, &storage, &img, 20));
++    try testing.expectEqual(@as(usize, 8), storage.total_bytes);
++    try testing.expectEqual(@as(usize, 1), context.frees);
++    try testing.expect(img.source == null);
++}
++
++test "deferred animation with one frame stops after decoder completion" {
++    const testing = std.testing;
++    const Source = @import("../sys.zig").Animation.Source;
++    const Context = struct {
++        fn next(_: Allocator, _: *anyopaque) @import("../sys.zig").DecodeError!Source.Poll {
++            return .done;
++        }
++        fn destroy(_: Allocator, _: *anyopaque) void {}
++    };
++    var context: u8 = 0;
++    var img: image.Image = .{ .width = 1, .height = 1, .format = .rgba, .animation = .run, .next_frame_ms = 10 };
++    defer img.deinit(testing.allocator);
++    try img.frames.append(testing.allocator, .{ .data = try testing.allocator.dupe(u8, &.{ 255, 0, 0, 255 }), .gap_ms = 10 });
++    img.selectFrame(0);
++    img.source = .{ .context = &context, .retained_bytes = 8, .next = Context.next, .destroy = Context.destroy };
++    var storage: Storage = .{ .total_limit = 64, .total_bytes = img.byteSize() };
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 1000));
++    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
++    try testing.expect(img.animation == .stop);
 +}

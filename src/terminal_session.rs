@@ -1390,18 +1390,34 @@ mod tests {
     fn animated_image_client_round_trips_through_conpty() {
         let command =
             std::env::var("IMAGE_PROTOCOL_TEST_COMMAND").expect("set the image client command");
+        let require_animation =
+            std::env::var("IMAGE_PROTOCOL_TEST_ANIMATION").as_deref() != Ok("0");
         let (mut session, _events) =
             TerminalSession::spawn(TerminalSize::new(100, 80, 10, 20)).unwrap();
         let launched = Instant::now();
-        session.input(format!("{command}\r").as_bytes()).unwrap();
+        session
+            .input(format!("{command} && echo IMAGE_PROTOCOL_CLIENT_FINISHED\r").as_bytes())
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut frames = std::collections::HashSet::new();
         let mut first_seen = None;
+        let mut client_finished = None;
         let mut last_screen = String::new();
         while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(80));
+            std::thread::sleep(Duration::from_millis(10));
             let snapshot = session.snapshot().unwrap();
             last_screen = snapshot_text(&snapshot);
+            if client_finished.is_none()
+                && last_screen
+                    .lines()
+                    .any(|line| line.trim() == "IMAGE_PROTOCOL_CLIENT_FINISHED")
+            {
+                client_finished = Some(launched.elapsed());
+                eprintln!("Image client finished after {:?}", client_finished.unwrap());
+                if !require_animation {
+                    return;
+                }
+            }
             if let Some(image) = snapshot.images.first() {
                 if first_seen.is_none() {
                     eprintln!("First animated image after {:?}", launched.elapsed());
@@ -1412,6 +1428,7 @@ mod tests {
                 frames.insert(hash.finish());
                 let started = first_seen.get_or_insert_with(Instant::now);
                 if started.elapsed() >= Duration::from_secs(7) {
+                    assert!(client_finished.is_some(), "image client did not finish");
                     assert!(
                         frames.len() > 10,
                         "expected an animation, got {} distinct frames",
