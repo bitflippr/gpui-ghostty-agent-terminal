@@ -252,9 +252,16 @@ pub(crate) fn init() {
 
 pub(crate) fn configure_media(terminal: *mut c_void) -> Result<(), String> {
     let path = std::env::temp_dir();
+    #[cfg(unix)]
+    let directory = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
     let directory = path
         .to_str()
-        .ok_or("temporary directory must be valid UTF-8")?;
+        .ok_or("temporary directory must be valid UTF-8")?
+        .as_bytes();
     let result =
         unsafe { spike_terminal_image_media(terminal, directory.as_ptr(), directory.len()) };
     if result == 0 {
@@ -586,6 +593,59 @@ unsafe extern "C" fn collect(context: *mut c_void, raw: *const RawImage) {
 mod tests {
     use crate::ghostty::Terminal;
     use base64::Engine;
+
+    #[cfg(unix)]
+    #[test]
+    fn text_session_accepts_non_utf8_temporary_directory() {
+        const CHILD: &str = "AGENT_TERMINAL_TEST_NON_UTF8_TMPDIR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::temp_dir().to_str().is_none());
+            let mut terminal = Terminal::new(20, 10).unwrap();
+            terminal.feed(b"ordinary text").unwrap();
+            let snapshot = terminal.render_update(true).unwrap();
+            let text: String = snapshot
+                .cells
+                .iter()
+                .filter(|cell| cell.y == 0)
+                .map(|cell| cell.text.as_str())
+                .collect();
+            assert!(text.starts_with("ordinary text"), "{text:?}");
+            return;
+        }
+
+        use std::os::unix::ffi::OsStringExt;
+        let mut name = format!(
+            "terminal-media-test-{}-{}-",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+        .into_bytes();
+        name.push(0xff);
+        let directory = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        std::fs::create_dir(&directory).unwrap();
+        // A child process keeps TMPDIR changes out of parallel parent tests.
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal_image::tests::text_session_accepts_non_utf8_temporary_directory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("TMPDIR", &directory)
+            .output();
+        std::fs::remove_dir(&directory).unwrap();
+        let output = result.unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn deferred_gif_preserves_frames_and_cancels_decode_ahead() {

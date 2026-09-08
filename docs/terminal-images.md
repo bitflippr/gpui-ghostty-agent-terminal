@@ -49,6 +49,10 @@ GPUI clips placements to the viewport, draws images in Kitty's three z layers,
 and paints the cursor last. Image generations share textures across placements;
 retired textures are explicitly removed from the window atlas. Replicated edge
 pixels prevent atlas padding from bleeding into enlarged images.
+Decoded frames and uploaded textures retain source resolution; the GPU draws
+only the requested destination area. Keeping the source preserves later crops
+and larger placements. CPU downsampling was measured separately and added
+texture-preparation work for the validation GIF, so it was not adopted.
 
 Windows reads wait on output completion and an interrupt event, with no polling
 sleep or idle spin. Resize, synchronization and shutdown wake pending reads;
