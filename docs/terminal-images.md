@@ -105,7 +105,7 @@ timing, set `IMAGE_PROTOCOL_BENCH_VARIANTS` to a JSON file such as:
 ```json
 [
   {"label": "plain", "command": "image-client.exe", "expect_image": false},
-  {"label": "image", "command": "image-client.exe --logo-path fixture.gif --logo-protocol iterm2", "expect_image": true}
+  {"label": "image", "command": "image-client.exe fixture.gif", "expect_image": true}
 ]
 ```
 
@@ -120,20 +120,19 @@ Tests can explicitly select another runtime with the absolute directory
 ### Windows performance checkpoint
 
 The September 7 measurements used the original 22,813,430-byte, 498-by-498,
-159-frame GIF, transferred without recompression. The optimized
-[Draconis++ interoperability client](../scripts/interop/draconis-image-client/README.md)
-streams 64 KiB iTerm2 multipart sequences, reuses buffers, and uses AVX2 base64
-encoding when supported, with a scalar fallback. Its isolated encoding time
-fell from about 50 ms to 8 ms. The largest end-to-end improvement requires
-both this client and the terminal changes.
+159-frame GIF, transferred without recompression. External test senders used
+either a single iTerm2 sequence or optimized 64 KiB multipart sequences.
+The sender implementations are not part of this repository. The before/after
+comparison includes sender optimizations as well as terminal changes; it does
+not isolate the terminal's contribution.
 
 Twelve interleaved repetitions per variant, measured from command submission
 immediately after spawning the shell through its completion marker:
 
 | Configuration | Before median (range) | After median (range) |
 | --- | --- | --- |
-| Draconis++ without GIF | 165.0 ms (162.6–195.1) | 165.1 ms (162.1–233.8) |
-| Draconis++ with GIF | 768.4 ms (758.5–811.9) | 259.5 ms (255.1–319.1) |
+| Test client without GIF | 165.0 ms (162.6–195.1) | 165.1 ms (162.1–233.8) |
+| Test client with GIF | 768.4 ms (758.5–811.9) | 259.5 ms (255.1–319.1) |
 
 The earlier terminal build is `b95968c`, paired with the original sender; the
 after measurement uses the optimized client and bundled x64 host. Total time

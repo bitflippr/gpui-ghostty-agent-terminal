@@ -11,7 +11,7 @@
     "recompressed": false
   },
   "baseline_terminal_commit": "b95968c",
-  "optimized_client_source": "edfbccb85bed14c7325f4841a42c84221b99b29c with scripts/interop/draconis-image-client/draconis-image-client.patch",
+  "sender_variants": "External single-sequence and optimized 64 KiB multipart test senders; implementations are not included in this repository. Before/after measurements include sender changes.",
   "patched_runtime": "1.24.260710001-agent.1",
   "before_after_boundary": "Command submission immediately after shell spawn to completion marker; fresh Terminal Session per sample; four variants rotated across twelve rounds.",
   "before_after": [
