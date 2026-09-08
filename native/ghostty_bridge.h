@@ -10,6 +10,24 @@ extern "C" {
 #endif
 
 typedef struct SpikeTerminal SpikeTerminal;
+typedef void (*SpikeDownloadCallback)(void*, const uint8_t*, size_t, const uint8_t*, size_t);
+int spike_terminal_download_handler(SpikeTerminal*, void*, SpikeDownloadCallback);
+
+typedef struct {
+  uint64_t generation;
+  uint32_t width, height;
+  const uint8_t* pixels;
+  size_t pixels_len;
+  int32_t format, col, row, z;
+  uint32_t offset_x, offset_y, display_width, display_height;
+  uint32_t source_x, source_y, source_width, source_height;
+  uint32_t id;
+} SpikeImage;
+typedef void (*SpikeImageCallback)(void*, const SpikeImage*);
+void spike_images_init(void);
+int spike_terminal_tick_images(SpikeTerminal*, uint64_t, bool*);
+int spike_terminal_image_media(SpikeTerminal*, const uint8_t*, size_t);
+int spike_terminal_images(SpikeTerminal*, void*, SpikeImageCallback);
 
 typedef struct {
   uint16_t x;

@@ -99,6 +99,7 @@ pub(crate) fn open_terminal_window(
                 pending_terminal_scrolls: HashMap::new(),
                 terminal_scroll_flush_scheduled: false,
                 terminal_render_cache: HashMap::new(),
+                retired_terminal_images: Vec::new(),
                 terminal_bounds: Arc::new(Mutex::new(HashMap::new())),
                 terminal_selection_drag: None,
                 move_source: None,
@@ -152,6 +153,7 @@ struct MultiplexerView {
     pending_terminal_scrolls: HashMap<TerminalSessionId, Vec<ghostty::ScrollInput>>,
     terminal_scroll_flush_scheduled: bool,
     terminal_render_cache: HashMap<TerminalSessionId, CachedTerminalRender>,
+    retired_terminal_images: Vec<Arc<gpui::RenderImage>>,
     terminal_bounds: Arc<Mutex<HashMap<PaneId, Bounds<Pixels>>>>,
     terminal_selection_drag: Option<TerminalSelectionDrag>,
     move_source: Option<PaneId>,
@@ -208,6 +210,7 @@ struct TerminalRenderKey {
 }
 
 struct CachedTerminalRender {
+    images: Arc<Vec<(crate::TerminalImage, Arc<gpui::RenderImage>)>>,
     key: TerminalRenderKey,
     frame: Arc<TerminalFrame>,
     shaped_rows: Arc<Vec<ShapedLine>>,
@@ -862,7 +865,14 @@ impl MultiplexerView {
         self.pending_terminal_scrolls
             .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
         self.terminal_render_cache
-            .retain(|terminal_session_id, _| terminal_ids.contains(terminal_session_id));
+            .retain(|terminal_session_id, cache| {
+                if terminal_ids.contains(terminal_session_id) {
+                    return true;
+                }
+                self.retired_terminal_images
+                    .extend(cache.images.iter().map(|(_, image)| image.clone()));
+                false
+            });
     }
 
     fn on_terminal_scroll(
@@ -916,11 +926,12 @@ impl MultiplexerView {
             .copied();
         let (pointer_x, pointer_y, viewport_width, viewport_height) =
             bounds.map_or((0.0, 0.0, 1, 1), |bounds| {
-                let width = f32::from(bounds.size.width).max(1.0);
-                let height = f32::from(bounds.size.height).max(1.0);
+                let scale = self.terminal_font.cells.scale_factor();
+                let width = (f32::from(bounds.size.width) * scale).max(1.0);
+                let height = (f32::from(bounds.size.height) * scale).max(1.0);
                 (
-                    f32::from(event.position.x - bounds.left()).clamp(0.0, width - 1.0),
-                    f32::from(event.position.y - bounds.top()).clamp(0.0, height - 1.0),
+                    (f32::from(event.position.x - bounds.left()) * scale).clamp(0.0, width - 1.0),
+                    (f32::from(event.position.y - bounds.top()) * scale).clamp(0.0, height - 1.0),
                     width.ceil() as u32,
                     height.ceil() as u32,
                 )
@@ -938,8 +949,8 @@ impl MultiplexerView {
             pointer_y,
             viewport_width,
             viewport_height,
-            cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
-            cell_height: self.terminal_font.cells.height_px().round().max(1.0) as u32,
+            cell_width: u32::from(self.terminal_font.cells.device_width_px()),
+            cell_height: u32::from(self.terminal_font.cells.device_height_px()),
             modifiers,
         };
         coalesce_scroll_input(
@@ -1442,7 +1453,10 @@ impl MultiplexerView {
         match TerminalFont::resolve(&self.settings, cx) {
             Ok(font) => {
                 self.terminal_font = font;
-                self.terminal_render_cache.clear();
+                for (_, cache) in self.terminal_render_cache.drain() {
+                    self.retired_terminal_images
+                        .extend(cache.images.iter().map(|(_, image)| image.clone()));
+                }
                 self.requested_sizes.clear();
                 self.save_settings(cx);
             }
@@ -1519,12 +1533,13 @@ impl MultiplexerView {
                 click_count: click_count.min(usize::from(u8::MAX)) as u8,
                 x: point.x,
                 y: point.y,
-                pointer_x,
-                pointer_y,
+                pointer_x: pointer_x * self.terminal_font.cells.scale_factor(),
+                pointer_y: pointer_y * self.terminal_font.cells.scale_factor(),
                 columns: u32::from(snapshot.cols),
-                cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
+                cell_width: u32::from(self.terminal_font.cells.device_width_px()),
                 padding_left: 0,
-                screen_height: screen_height.ceil() as u32,
+                screen_height: (screen_height * self.terminal_font.cells.scale_factor()).ceil()
+                    as u32,
             },
             autoscroll,
         ))
@@ -3859,6 +3874,7 @@ impl MultiplexerView {
                 .child("Starting terminal…")
                 .into_any_element();
         };
+        let downloads = snapshot.downloads.clone();
         let cursor_visible = cursor_should_be_visible(
             inactive,
             snapshot.cursor_blinking,
@@ -3891,11 +3907,54 @@ impl MultiplexerView {
 
         if let Some((frame, selection_rows)) = next_render {
             let previous = self.terminal_render_cache.remove(&terminal_session_id);
+            let mut textures = HashMap::new();
+            if let Some(cache) = &previous {
+                for (placement, image) in cache.images.iter() {
+                    textures.insert(placement.generation, image.clone());
+                }
+            }
+            let images = self
+                .terminals
+                .get(&terminal_session_id)
+                .map(|snapshot| {
+                    snapshot
+                        .images
+                        .iter()
+                        .map(|placement| {
+                            let image = textures
+                                .entry(placement.generation)
+                                .or_insert_with(|| {
+                                    // Replicate the edge texels so linear filtering cannot
+                                    // sample transparent atlas padding when enlarging images.
+                                    let buffer = terminal_image_texture(
+                                        &placement.rgba,
+                                        placement.width,
+                                        placement.height,
+                                    );
+                                    Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+                                        buffer,
+                                    )]))
+                                })
+                                .clone();
+                            (placement.clone(), image)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (generation, image) in textures {
+                if !images
+                    .iter()
+                    .any(|(placement, _)| placement.generation == generation)
+                {
+                    cx.drop_image(image, Some(window));
+                }
+            }
             let shaped_rows =
                 shape_terminal_rows(&frame.rows, previous.as_ref(), &self.terminal_font, window);
             self.terminal_render_cache.insert(
                 terminal_session_id,
                 CachedTerminalRender {
+                    images: Arc::new(images),
                     key: render_key,
                     frame: Arc::new(frame),
                     shaped_rows: Arc::new(shaped_rows),
@@ -3908,6 +3967,7 @@ impl MultiplexerView {
             .get(&terminal_session_id)
             .expect("terminal render cache is populated before painting");
         let frame = Arc::clone(&cached.frame);
+        let images = Arc::clone(&cached.images);
         let shaped_rows = Arc::clone(&cached.shaped_rows);
         let selection_rows = Arc::clone(&cached.selection_rows);
         let terminal_font = self.terminal_font.clone();
@@ -3923,6 +3983,7 @@ impl MultiplexerView {
                 shaped_rows.as_ref().clone()
             },
             move |bounds, lines, window, _cx| {
+                paint_terminal_images(&images, bounds, &paint_font, i32::MIN, -1073741825, window);
                 for background in &frame.opaque_backgrounds {
                     window.paint_quad(fill(
                         Bounds::new(
@@ -3960,6 +4021,7 @@ impl MultiplexerView {
                         selection_background,
                     ));
                 }
+                paint_terminal_images(&images, bounds, &paint_font, -1073741824, -1, window);
                 for (y, line) in lines.iter().enumerate() {
                     let cursor_x = frame
                         .cursor_cell
@@ -3978,6 +4040,7 @@ impl MultiplexerView {
                         window,
                     );
                 }
+                paint_terminal_images(&images, bounds, &paint_font, 0, i32::MAX, window);
                 if let Some(cursor) = frame.cursor_overlay {
                     let cell_width = paint_font.cells.width_px();
                     let cell_height = paint_font.cells.height_px();
@@ -4022,6 +4085,48 @@ impl MultiplexerView {
                 view.on_terminal_scroll(pane_id, terminal_session_id, event, window, cx)
             }))
             .child(terminal_canvas)
+            .when(!downloads.is_empty(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(12.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .children(downloads.into_iter().rev().take(3).enumerate().map(
+                            |(index, download)| {
+                                let (label, path) = match download.result {
+                                    None => (format!("Saving {}...", download.name), None),
+                                    Some(Ok(path)) => (
+                                        format!("Saved {} - Show in folder", download.name),
+                                        Some(path),
+                                    ),
+                                    Some(Err(error)) => {
+                                        (format!("{}: {}", download.name, error), None)
+                                    }
+                                };
+                                div()
+                                    .id(("terminal-download", index))
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .bg(rgb(0x202630))
+                                    .text_color(rgb(0xe0e6ef))
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        if let Some(path) = &path {
+                                            cx.reveal_path(path);
+                                        }
+                                    })
+                            },
+                        )),
+                )
+            })
             .when_some(
                 self.terminal_errors.get(&terminal_session_id).cloned(),
                 |this, error| {
@@ -4136,6 +4241,22 @@ fn accept_terminal_snapshot(
 
 impl Render for MultiplexerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cells = self.terminal_font.cells.at_scale(window.scale_factor());
+        if cells != self.terminal_font.cells {
+            self.terminal_font.primary_baseline_px +=
+                (cells.height_px() - self.terminal_font.cells.height_px()) / 2.;
+            self.terminal_font.cells = cells;
+            for (_, cache) in self.terminal_render_cache.drain() {
+                self.retired_terminal_images
+                    .extend(cache.images.iter().map(|(_, image)| image.clone()));
+            }
+        }
+        let mut released = HashSet::new();
+        for image in self.retired_terminal_images.drain(..) {
+            if released.insert(Arc::as_ptr(&image)) {
+                cx.drop_image(image, Some(window));
+            }
+        }
         if !self.settings_open {
             self.resize_visible_terminals(window.viewport_size());
         }
@@ -5091,6 +5212,90 @@ fn lifecycle_message(lifecycle: &TerminalLifecycle) -> Option<String> {
     }
 }
 
+fn terminal_image_texture(rgba: &[u8], width: u32, height: u32) -> image::RgbaImage {
+    let stride = (width as usize + 2) * 4;
+    let height_usize = height as usize;
+    let mut pixels = vec![0; stride * (height_usize + 2)];
+    // Convert one contiguous row at a time. Avoid coordinate division and
+    // clamping for every pixel so the channel shuffle can be vectorized.
+    for (source, row) in rgba
+        .chunks_exact(width as usize * 4)
+        .zip(pixels[stride..stride * (height_usize + 1)].chunks_exact_mut(stride))
+    {
+        for (pixel, output) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(row[4..stride - 4].as_chunks_mut::<4>().0.iter_mut())
+        {
+            *output = [pixel[2], pixel[1], pixel[0], pixel[3]];
+        }
+        row.copy_within(4..8, 0);
+        row.copy_within(stride - 8..stride - 4, stride - 4);
+    }
+    pixels.copy_within(stride..stride * 2, 0);
+    pixels.copy_within(
+        stride * height_usize..stride * (height_usize + 1),
+        stride * (height_usize + 1),
+    );
+    image::RgbaImage::from_raw(width + 2, height + 2, pixels)
+        .expect("terminal image has validated dimensions")
+}
+
+fn paint_terminal_images(
+    images: &[(crate::TerminalImage, Arc<gpui::RenderImage>)],
+    bounds: Bounds<Pixels>,
+    font: &TerminalFont,
+    min_z: i32,
+    max_z: i32,
+    window: &mut Window,
+) {
+    let device_scale = window.scale_factor();
+    for (placement, image) in images {
+        if placement.z < min_z
+            || placement.z > max_z
+            || placement.source_width == 0
+            || placement.source_height == 0
+        {
+            continue;
+        }
+        let x = bounds.left()
+            + px(placement.col as f32 * font.cells.width_px()
+                + placement.offset_x as f32 / device_scale);
+        let y = bounds.top()
+            + px(placement.row as f32 * font.cells.height_px()
+                + placement.offset_y as f32 / device_scale);
+        let scale_x = placement.display_width as f32 / placement.source_width as f32 / device_scale;
+        let scale_y =
+            placement.display_height as f32 / placement.source_height as f32 / device_scale;
+        let destination = Bounds::new(
+            point(x, y),
+            size(
+                px(placement.display_width as f32 / device_scale),
+                px(placement.display_height as f32 / device_scale),
+            ),
+        );
+        let whole_image = Bounds::new(
+            point(
+                x - px((placement.source_x + 1) as f32 * scale_x),
+                y - px((placement.source_y + 1) as f32 * scale_y),
+            ),
+            size(
+                px((placement.width + 2) as f32 * scale_x),
+                px((placement.height + 2) as f32 * scale_y),
+            ),
+        );
+        let _ = window.paint_image(
+            destination.intersect(&bounds),
+            whole_image,
+            gpui::Corners::default(),
+            image.clone(),
+            0,
+            false,
+        );
+    }
+}
+
 fn paint_fixed_cell_line(
     row: &FrameRow,
     line: &ShapedLine,
@@ -5402,6 +5607,61 @@ mod tests {
     };
     use gpui::{Keystroke, Modifiers};
     use std::collections::HashMap;
+
+    #[test]
+    fn image_texture_preserves_alpha_and_replicates_all_edges() {
+        for (width, height) in [(1, 1), (1, 7), (7, 1), (3, 5)] {
+            let rgba = (0..width * height * 4)
+                .map(|index| (index * 71 % 256) as u8)
+                .collect::<Vec<_>>();
+            let actual = super::terminal_image_texture(&rgba, width, height);
+            let expected = image::RgbaImage::from_fn(width + 2, height + 2, |x, y| {
+                let x = x.saturating_sub(1).min(width - 1);
+                let y = y.saturating_sub(1).min(height - 1);
+                let pixel = &rgba[((y * width + x) * 4) as usize..];
+                image::Rgba([pixel[2], pixel[1], pixel[0], pixel[3]])
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual comparison of image texture packing implementations"]
+    fn profile_image_texture_preparation() {
+        use std::{hint::black_box, time::Instant};
+        for (width, height) in [(498, 498), (1920, 1080)] {
+            let rgba = (0..width * height * 4)
+                .map(|index| (index * 71 % 256) as u8)
+                .collect::<Vec<_>>();
+            let old = |rgba: &[u8]| {
+                image::RgbaImage::from_fn(width + 2, height + 2, |x, y| {
+                    let x = x.saturating_sub(1).min(width - 1);
+                    let y = y.saturating_sub(1).min(height - 1);
+                    let pixel = &rgba[((y * width + x) * 4) as usize..];
+                    image::Rgba([pixel[2], pixel[1], pixel[0], pixel[3]])
+                })
+            };
+            for round in 0..4 {
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(old(black_box(&rgba)));
+                }
+                let old_elapsed = start.elapsed() / 100;
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(super::terminal_image_texture(
+                        black_box(&rgba),
+                        width,
+                        height,
+                    ));
+                }
+                eprintln!(
+                    "Texture {width}x{height} round={round} old={old_elapsed:?} rows={:?}",
+                    start.elapsed() / 100
+                );
+            }
+        }
+    }
 
     #[test]
     fn keyboard_navigation_wraps_and_handles_empty_or_missing_selection() {
@@ -6354,6 +6614,8 @@ mod tests {
             terminal_session_id,
             None,
             TerminalSnapshot {
+                images: Vec::new(),
+                downloads: Vec::new(),
                 revision: 1,
                 lifecycle: TerminalLifecycle::Running,
                 active_work: false,
@@ -6391,6 +6653,8 @@ mod tests {
             .snapshot;
         let terminal_session_id = hierarchy.terminal_sessions[0].id;
         let snapshot = |revision, cols| TerminalSnapshot {
+            images: Vec::new(),
+            downloads: Vec::new(),
             revision,
             lifecycle: TerminalLifecycle::Running,
             active_work: false,

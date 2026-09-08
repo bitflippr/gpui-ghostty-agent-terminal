@@ -102,6 +102,7 @@ impl Default for RawSnapshot {
 }
 
 unsafe extern "C" {
+    fn spike_terminal_tick_images(terminal: *mut c_void, now_ms: u64, changed: *mut bool) -> i32;
     fn spike_terminal_new(cols: u16, rows: u16, scrollback: usize) -> *mut c_void;
     fn spike_terminal_free(terminal: *mut c_void);
     fn spike_terminal_write(
@@ -207,6 +208,8 @@ unsafe extern "C" {
 pub const SOURCE_REVISION: &str = env!("GHOSTTY_SOURCE_REVISION");
 
 pub struct Terminal {
+    images: crate::terminal_image::ImageCache,
+    downloads: Box<crate::terminal_download::DownloadQueue>,
     raw: NonNull<c_void>,
     raw_cells: Box<[RawCell]>,
     selection_text_cache: Option<String>,
@@ -285,6 +288,8 @@ impl SelectionInput {
 }
 
 pub struct Snapshot {
+    pub images: Vec<crate::TerminalImage>,
+    pub downloads: Vec<crate::terminal_download::DownloadStatus>,
     pub full: bool,
     pub dirty_rows: Vec<u16>,
     pub cols: u16,
@@ -342,15 +347,53 @@ pub struct Cell {
 
 impl Terminal {
     pub fn new(cols: u16, rows: u16) -> Result<Self, String> {
+        crate::terminal_image::init();
         let raw = unsafe { spike_terminal_new(cols, rows, DEFAULT_SCROLLBACK_BYTES) };
+        let raw = NonNull::new(raw).ok_or("libghostty-vt terminal allocation failed")?;
+        if let Err(error) = crate::terminal_image::configure_media(raw.as_ptr()) {
+            unsafe { spike_terminal_free(raw.as_ptr()) };
+            return Err(error);
+        }
+        let mut downloads = Box::new(crate::terminal_download::DownloadQueue::default());
+        if let Err(error) = downloads.install(raw.as_ptr()) {
+            unsafe { spike_terminal_free(raw.as_ptr()) };
+            return Err(error);
+        }
         Ok(Self {
-            raw: NonNull::new(raw).ok_or("libghostty-vt terminal allocation failed")?,
+            downloads,
+            images: Default::default(),
+            raw,
             raw_cells: (0..SNAPSHOT_CELL_CAPACITY)
                 .map(|_| RawCell::default())
                 .collect(),
             selection_text_cache: None,
             selection_dragging: false,
         })
+    }
+
+    pub fn tick_images(&mut self, now_ms: u64) -> Result<bool, String> {
+        let mut changed = false;
+        result_ok(
+            unsafe { spike_terminal_tick_images(self.raw.as_ptr(), now_ms, &mut changed) },
+            "advance image animations",
+        )?;
+        Ok(changed)
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn tick_images_now(&mut self) -> Result<bool, String> {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        self.tick_images(
+            ORIGIN
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        )
+    }
+
+    pub fn take_downloads(&mut self) -> Vec<crate::terminal_download::Download> {
+        self.downloads.take()
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -787,6 +830,8 @@ impl Terminal {
         let selection_text = self.selection_text_cache.clone();
 
         Ok(Snapshot {
+            images: self.images.snapshot(self.raw.as_ptr())?,
+            downloads: Vec::new(),
             full: raw_snapshot.full,
             dirty_rows,
             cols: raw_snapshot.cols,

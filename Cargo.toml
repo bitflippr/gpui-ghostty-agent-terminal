@@ -37,6 +37,8 @@ gui = [
 ]
 
 [dependencies]
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 ctrlc = { version = "3.5", features = ["termination"], optional = true }
 fancy-regex = "0.18"
 flume = { version = "0.12", optional = true }
@@ -67,8 +69,13 @@ windows-sys = { version = "0.61", optional = true, features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+flate2 = "1"

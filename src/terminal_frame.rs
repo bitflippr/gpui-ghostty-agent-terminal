@@ -139,7 +139,7 @@ impl TerminalFrame {
                 }
 
                 match cell.map(|cell| cell.text.as_str()) {
-                    Some(value) if !value.is_empty() => {
+                    Some(value) if !value.is_empty() && !value.starts_with('\u{10eeee}') => {
                         push_text_cell(&mut text, &mut glyph_cells, x, width, value, foreground);
                         push_foreground(&mut runs, value.len(), foreground);
                     }
@@ -500,6 +500,8 @@ mod tests {
         cells: Vec<TerminalCell>,
     ) -> TerminalSnapshot {
         TerminalSnapshot {
+            images: Vec::new(),
+            downloads: Vec::new(),
             revision: 1,
             lifecycle: TerminalLifecycle::Running,
             active_work: false,

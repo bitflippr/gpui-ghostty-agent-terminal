@@ -199,6 +199,7 @@ pub struct TerminalSession {
     output: Option<flume::Receiver<PtyOutput>>,
     size: TerminalSize,
     pending_response: Vec<u8>,
+    downloads: crate::terminal_download::Downloads,
 }
 
 impl TerminalSession {
@@ -214,7 +215,13 @@ impl TerminalSession {
         working_directory: &std::path::Path,
     ) -> Result<(Self, TerminalEvents), String> {
         let size = size.validate()?;
-        let terminal = ghostty::Terminal::new(size.cols, size.rows)?;
+        let mut terminal = ghostty::Terminal::new(size.cols, size.rows)?;
+        terminal.resize(
+            size.cols,
+            size.rows,
+            u32::from(size.cell_width_px),
+            u32::from(size.cell_height_px),
+        )?;
         let (events_tx, events_rx) = TerminalEventSender::channel();
         let (process, output) = PtySession::spawn(size.pty_size(), working_directory, events_tx)?;
         Ok((
@@ -224,6 +231,7 @@ impl TerminalSession {
                 output: Some(output),
                 size,
                 pending_response: Vec::new(),
+                downloads: Default::default(),
             },
             events_rx,
         ))
@@ -378,7 +386,9 @@ impl TerminalSession {
     }
 
     pub(crate) fn render_update(&mut self, force_full: bool) -> Result<ghostty::Snapshot, String> {
-        self.terminal.render_update(force_full)
+        let mut snapshot = self.terminal.render_update(force_full)?;
+        snapshot.downloads = self.downloads.snapshot();
+        Ok(snapshot)
     }
 
     pub(crate) fn drain_pending_output(&mut self) -> Result<bool, String> {
@@ -401,9 +411,9 @@ impl TerminalSession {
     }
 
     fn drain_output(&mut self) -> Result<bool, String> {
-        let mut changed = false;
+        let mut changed = self.terminal.tick_images_now()? | self.downloads.poll();
         if !self.flush_pending_response()? {
-            return Ok(false);
+            return Ok(changed);
         }
         loop {
             let message = self
@@ -477,7 +487,11 @@ impl TerminalSession {
     }
 
     fn feed_process_output(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.terminal.tick_images_now()?;
         let response = self.terminal.feed(bytes)?;
+        for download in self.terminal.take_downloads() {
+            self.downloads.submit(download);
+        }
         self.queue_terminal_response(&response)
     }
 
@@ -865,6 +879,7 @@ mod tests {
             output: Some(output_rx),
             size: previous_size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         session.resize(next_size).expect("resize terminal session");
@@ -890,6 +905,7 @@ mod tests {
             output: Some(output_rx),
             size: previous_size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         session.resize(next_size).expect("resize terminal session");
@@ -917,6 +933,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         output_tx
@@ -931,6 +948,52 @@ mod tests {
                 .as_slice(),
             b"\x1b[?62;22c"
         );
+    }
+
+    #[test]
+    fn completed_download_notifies_renderer_while_process_input_is_backpressured() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let backpressured = Arc::new(Mutex::new(true));
+        let (output_tx, output_rx) = flume::unbounded();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let mut session = TerminalSession {
+            terminal: ghostty::Terminal::new(size.cols, size.rows).expect("create terminal"),
+            process: Box::new(BackpressuredTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx,
+                backpressured,
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: b"\x1b[?62;22c".to_vec(),
+            downloads: crate::terminal_download::Downloads::with_pending_completion(completed_rx),
+        };
+        assert!(
+            !session
+                .drain_pending_output()
+                .expect("poll pending download")
+        );
+        let saved_path = std::path::PathBuf::from("test-download");
+        completed_tx
+            .send(Ok(saved_path.clone()))
+            .expect("finish download");
+        assert!(session.drain_pending_output().expect("publish completion"));
+        assert_eq!(
+            session
+                .render_update(false)
+                .expect("render download")
+                .downloads[0]
+                .result,
+            Some(Ok(saved_path))
+        );
+        assert!(
+            !session
+                .drain_pending_output()
+                .expect("completion consumed once")
+        );
+        assert!(!session.pending_response.is_empty());
+        assert!(bytes.lock().expect("recorded input").is_empty());
     }
 
     #[test]
@@ -950,6 +1013,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         output_tx
@@ -996,6 +1060,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         output_tx
@@ -1029,6 +1094,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         output_tx
@@ -1085,6 +1151,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         assert!(session.input(b"x").expect("write terminal input"));
@@ -1119,6 +1186,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         session
@@ -1169,6 +1237,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         assert!(session.paste(b"x").expect("paste terminal input"));
@@ -1204,6 +1273,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         session
@@ -1244,6 +1314,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         assert!(
@@ -1291,6 +1362,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
         for delta in [isize::MIN, -1, 1, isize::MAX] {
             session.scroll_viewport(delta).unwrap();
@@ -1319,6 +1391,7 @@ mod tests {
             output: Some(output_rx),
             size,
             pending_response: Vec::new(),
+            downloads: Default::default(),
         };
 
         assert!(session.paste(b"payload").is_err());
@@ -1359,6 +1432,175 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires IMAGE_PROTOCOL_BENCH_VARIANTS pointing to a JSON command list"]
+    fn compare_image_client_startup_through_conpty() {
+        #[derive(serde::Deserialize)]
+        struct Variant {
+            label: String,
+            command: String,
+            expect_image: bool,
+        }
+        let path = std::env::var("IMAGE_PROTOCOL_BENCH_VARIANTS").expect("set benchmark JSON path");
+        let variants: Vec<Variant> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!variants.is_empty());
+        let rounds = std::env::var("IMAGE_PROTOCOL_BENCH_ROUNDS")
+            .map(|value| value.parse::<usize>().expect("positive round count"))
+            .unwrap_or(6);
+        assert!((1..=100).contains(&rounds));
+
+        for round in 0..rounds {
+            // Rotate the first variant so warming and background load do not
+            // consistently favor one sender. Each sample has a fresh VT/PTY.
+            for offset in 0..variants.len() {
+                let variant = &variants[(round + offset) % variants.len()];
+                let startup = Instant::now();
+                let (mut session, events) =
+                    TerminalSession::spawn(TerminalSize::new(100, 80, 10, 20)).unwrap();
+                session
+                    .input(b"@echo off\r\necho IMAGE_BENCH_READY\r\n")
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let _ = events.recv_timeout(Duration::from_millis(10));
+                    let screen = snapshot_text(&session.snapshot().unwrap());
+                    if screen
+                        .lines()
+                        .any(|line| line.trim() == "IMAGE_BENCH_READY")
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "shell failed to become ready: {screen}"
+                    );
+                }
+                let ready_ms = startup.elapsed().as_secs_f64() * 1000.0;
+                let launched = Instant::now();
+                session
+                    .input(format!("{} && echo IMAGE_BENCH_DONE\r\n", variant.command).as_bytes())
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut first_image_ms = None;
+                let mut completed_ms = None;
+                loop {
+                    let _ = events.recv_timeout(Duration::from_millis(10));
+                    let snapshot = session.snapshot().unwrap();
+                    if !snapshot.images.is_empty() && first_image_ms.is_none() {
+                        first_image_ms = Some(launched.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    let screen = snapshot_text(&snapshot);
+                    if completed_ms.is_none()
+                        && screen.lines().any(|line| line.trim() == "IMAGE_BENCH_DONE")
+                    {
+                        completed_ms = Some(launched.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    if completed_ms.is_some() && (!variant.expect_image || first_image_ms.is_some())
+                    {
+                        eprintln!(
+                            "IMAGE_BENCH {}",
+                            serde_json::json!({
+                                "round": round + 1, "label": variant.label,
+                                "shell_ready_ms": ready_ms, "first_image_ms": first_image_ms,
+                                "completed_ms": completed_ms.unwrap(),
+                            })
+                        );
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} did not complete or display its expected image: {screen}",
+                        variant.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires IMAGE_PROTOCOL_TEST_COMMAND naming an installed image client"]
+    fn animated_image_client_round_trips_through_conpty() {
+        let command =
+            std::env::var("IMAGE_PROTOCOL_TEST_COMMAND").expect("set the image client command");
+        let require_animation =
+            std::env::var("IMAGE_PROTOCOL_TEST_ANIMATION").as_deref() != Ok("0");
+        let (mut session, _events) =
+            TerminalSession::spawn(TerminalSize::new(100, 80, 10, 20)).unwrap();
+        let launched = Instant::now();
+        session
+            .input(format!("{command} && echo IMAGE_PROTOCOL_CLIENT_FINISHED\r").as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut frames = std::collections::HashSet::new();
+        let mut first_seen = None;
+        let mut client_finished = None;
+        let mut last_screen = String::new();
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            let snapshot = session.snapshot().unwrap();
+            last_screen = snapshot_text(&snapshot);
+            if client_finished.is_none()
+                && last_screen
+                    .lines()
+                    .any(|line| line.trim() == "IMAGE_PROTOCOL_CLIENT_FINISHED")
+            {
+                client_finished = Some(launched.elapsed());
+                eprintln!("Image client finished after {:?}", client_finished.unwrap());
+                if !require_animation {
+                    return;
+                }
+            }
+            if let Some(image) = snapshot.images.first() {
+                if first_seen.is_none() {
+                    eprintln!("First animated image after {:?}", launched.elapsed());
+                }
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                image.rgba.hash(&mut hash);
+                frames.insert(hash.finish());
+                let started = first_seen.get_or_insert_with(Instant::now);
+                if started.elapsed() >= Duration::from_secs(7) {
+                    assert!(client_finished.is_some(), "image client did not finish");
+                    assert!(
+                        frames.len() > 10,
+                        "expected an animation, got {} distinct frames",
+                        frames.len()
+                    );
+                    eprintln!(
+                        "Client animation: {}x{}, {} distinct frames over seven seconds",
+                        image.width,
+                        image.height,
+                        frames.len()
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("Image client did not produce a sustained animation: {last_screen}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kitty_image_round_trips_through_conpty() {
+        let (mut session, events) = TerminalSession::spawn(TerminalSize::default()).unwrap();
+        session.input(b"powershell.exe -NoProfile -Command \"[Console]::Write(([char]27)+'_Ga=T,f=24,s=1,v=1,i=43,q=2;/wAA'+([char]27)+'\\'); [Console]::WriteLine('IMAGE_DONE')\"\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_screen = String::new();
+        while Instant::now() < deadline {
+            if let Ok(TerminalEvent::Changed) = events.recv_timeout(Duration::from_millis(100)) {
+                let snapshot = session.snapshot().unwrap();
+                if let Some(image) = snapshot.images.first() {
+                    assert_eq!(&*image.rgba, &[255, 0, 0, 255]);
+                    return;
+                }
+                last_screen = snapshot_text(&snapshot);
+            }
+        }
+        panic!("Kitty image did not pass through ConPTY. Last screen: {last_screen}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn control_c_interrupts_a_windows_conpty_foreground_process() {
         let (mut session, events) =
             TerminalSession::spawn(TerminalSize::default()).expect("spawn terminal session");
@@ -1367,6 +1609,17 @@ mod tests {
             .expect("start foreground ping process");
 
         wait_for_windows_foreground_process(&mut session, &events, true);
+        // Process creation precedes console initialization. Wait for ping to
+        // actually run before testing delivery of Ctrl+C to its console.
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = session.snapshot().expect("snapshot running ping");
+            if snapshot_text(&snapshot).contains("TTL=") {
+                break;
+            }
+            assert!(Instant::now() < ready_deadline, "ping did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         session.input(&[0x03]).expect("send Ctrl+C through ConPTY");
         wait_for_windows_foreground_process(&mut session, &events, false);
         session

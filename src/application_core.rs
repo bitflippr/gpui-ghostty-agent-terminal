@@ -655,6 +655,8 @@ fn publish_semantic_event(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSnapshot {
+    pub images: Vec<crate::TerminalImage>,
+    pub downloads: Vec<crate::terminal_download::DownloadStatus>,
     pub revision: u64,
     pub lifecycle: TerminalLifecycle,
     pub active_work: bool,
@@ -751,6 +753,8 @@ impl TerminalSnapshot {
             default_fg: update.default_fg,
             default_bg: update.default_bg,
             selection_text: update.selection_text,
+            images: update.images,
+            downloads: update.downloads,
             cells: update.cells,
         }
         .with_refreshed_agent(update.agent_program))
@@ -775,6 +779,8 @@ impl TerminalSnapshot {
         self.cells.extend(update.cells);
         self.cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
         self.revision = update.revision;
+        self.images = update.images;
+        self.downloads = update.downloads;
         self.lifecycle = update.lifecycle;
         self.active_work = update.active_work;
         self.title = update.title;
@@ -804,6 +810,8 @@ impl TerminalSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TerminalUpdate {
+    images: Vec<crate::TerminalImage>,
+    downloads: Vec<crate::terminal_download::DownloadStatus>,
     base_revision: Option<u64>,
     revision: u64,
     lifecycle: TerminalLifecycle,
@@ -848,6 +856,8 @@ impl TerminalUpdate {
             default_fg: snapshot.default_fg,
             default_bg: snapshot.default_bg,
             selection_text: snapshot.selection_text,
+            images: snapshot.images,
+            downloads: snapshot.downloads,
             dirty_rows: snapshot.dirty_rows,
             cells: snapshot.cells.into_iter().map(TerminalCell::from).collect(),
         }
@@ -857,6 +867,8 @@ impl TerminalUpdate {
         const COLS: u16 = 80;
         const ROWS: u16 = 24;
         Self {
+            images: Vec::new(),
+            downloads: Vec::new(),
             base_revision: None,
             revision,
             lifecycle,

@@ -29,7 +29,8 @@ Elevated launches are rejected before activation or Terminal Session startup.
 
 - Ghostty `4c725242b7dbe8c77c6e227ef1f9540c5ef17921`
 - GPUI `fa00dccc42311f8dc71c533105488b0dbd518138`
-- Microsoft ConPTY redistributable `1.24.260710001` on Windows x64
+- ConPTY bundle `1.24.260710001-agent.1` on Windows x64, with a
+  [patched output parser](vendor/microsoft-conpty-patches/README.md)
 - Zig `0.16.0`
 
 ## Commands

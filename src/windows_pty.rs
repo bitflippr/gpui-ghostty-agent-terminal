@@ -11,7 +11,7 @@ use std::{
     ffi::{OsStr, OsString, c_void},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::windows::ffi::OsStrExt,
+    os::windows::{ffi::OsStrExt, io::AsRawHandle},
     path::{Path, PathBuf},
     ptr::null_mut,
     sync::{
@@ -21,27 +21,36 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FreeLibrary, HANDLE, HMODULE,
-        INVALID_HANDLE_VALUE, S_OK, WAIT_FAILED, WAIT_OBJECT_0,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_IO_PENDING,
+        ERROR_LOCK_VIOLATION, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, FreeLibrary,
+        GENERIC_WRITE, HANDLE, HMODULE, INVALID_HANDLE_VALUE, S_OK, WAIT_FAILED, WAIT_OBJECT_0,
     },
     Security::{
         GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     },
-    Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW},
+    Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+        REPLACEFILE_WRITE_THROUGH, ReplaceFileW, UnlockFileEx,
+    },
     System::{
         Console::{COORD, HPCON, SetConsoleCtrlHandler},
+        IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
         LibraryLoader::{
             GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
             LoadLibraryExW,
         },
-        Pipes::{CreatePipe, PeekNamedPipe},
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, CreatePipe, PIPE_REJECT_REMOTE_CLIENTS,
+            PeekNamedPipe,
+        },
         Threading::{
-            CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-            STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
-            WaitForSingleObject,
+            CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+            INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            OpenProcessToken, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResetEvent,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetEvent, TerminateProcess,
+            UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
         },
     },
 };
@@ -65,7 +74,7 @@ unsafe extern "system" {
 }
 
 const CONPTY_RUNTIME_VERSION: &str = env!("AGENT_TERMINAL_CONPTY_VERSION");
-const CONPTY_PACKAGE_HASH_PREFIX: &str = "9382ad7becb7e4d8";
+const CONPTY_PACKAGE_HASH_PREFIX: &str = env!("AGENT_TERMINAL_CONPTY_HASH_PREFIX");
 const CONPTY_DLL: &str = "conpty.dll";
 const CONPTY_X64_HOST: &str = "x64/OpenConsole.exe";
 const CONPTY_ARM64_HOST: &str = "arm64/OpenConsole.exe";
@@ -140,9 +149,18 @@ impl ConptyApi {
 
     fn load() -> Result<Self, String> {
         ensure_unelevated()?;
+        #[cfg(test)]
+        if let Some(directory) = std::env::var_os("IMAGE_PROTOCOL_BENCH_CONPTY_DIR") {
+            let directory = PathBuf::from(directory);
+            if !directory.is_absolute() {
+                return Err("benchmark ConPTY directory must be absolute".into());
+            }
+            eprintln!("Using explicitly selected benchmark ConPTY runtime");
+            return Self::load_library(&directory);
+        }
         let cache_root = runtime_cache_root()?;
         let api = Self::load_bundled_from_cache_root(&cache_root)?;
-        eprintln!("Using bundled Microsoft ConPTY {CONPTY_RUNTIME_VERSION} runtime");
+        eprintln!("Using bundled ConPTY {CONPTY_RUNTIME_VERSION} runtime");
         Ok(api)
     }
 
@@ -159,6 +177,10 @@ impl ConptyApi {
 
     fn load_bundled(runtime_directory: &Path) -> Result<Self, String> {
         validate_bundled_runtime(runtime_directory)?;
+        Self::load_library(runtime_directory)
+    }
+
+    fn load_library(runtime_directory: &Path) -> Result<Self, String> {
         let library = runtime_directory.join(CONPTY_DLL);
         let library = nul_terminated(library.as_os_str(), "bundled ConPTY library")?;
         let module = unsafe {
@@ -278,10 +300,71 @@ fn runtime_directory(cache_root: &Path) -> PathBuf {
 }
 
 fn materialize_bundled_runtime(runtime_directory: &Path) -> Result<(), String> {
+    // A complete cache needs no writes or publication lock. A concurrent
+    // publication or repair can make this check fail transiently; retry under
+    // the lock in that case.
+    if validate_bundled_runtime(runtime_directory).is_ok() {
+        return Ok(());
+    }
+    let _publication = RuntimePublication::lock(runtime_directory)?;
     for embedded in EMBEDDED_CONPTY_RUNTIME {
         materialize_runtime_file(runtime_directory, embedded)?;
     }
     validate_bundled_runtime(runtime_directory)
+}
+
+struct RuntimePublication(File);
+
+impl RuntimePublication {
+    fn lock(directory: &Path) -> Result<Self, String> {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("create bundled ConPTY runtime directory: {error}"))?;
+        // The directory inherits the per-user cache's permissions. A file
+        // lock avoids a public kernel-object name that another user could
+        // pre-create, and serializes publishers across Windows sessions.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(".publish.lock"))
+            .map_err(|error| format!("open ConPTY publication lock: {error}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut overlapped = OVERLAPPED::default();
+            if unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    &mut overlapped,
+                )
+            } != 0
+            {
+                return Ok(Self(file));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+                return Err(format!("acquire ConPTY publication lock: {error}"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out acquiring ConPTY publication lock".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for RuntimePublication {
+    fn drop(&mut self) {
+        // Windows file replacement can transiently deny concurrent opens.
+        // Serialize validation and publication across processes as well as
+        // threads. The OS also releases the file lock after a crashed owner.
+        let mut overlapped = OVERLAPPED::default();
+        unsafe { UnlockFileEx(self.0.as_raw_handle(), 0, 1, 0, &mut overlapped) };
+    }
 }
 
 fn materialize_runtime_file(
@@ -452,6 +535,7 @@ pub struct PtySession {
     process: OwnedHandle,
     process_id: u32,
     control: flume::Sender<ReaderControl>,
+    reader_wake: OwnedHandle,
     shutdown: Option<flume::Sender<()>>,
 }
 
@@ -493,8 +577,12 @@ impl PtySession {
         arguments: &[OsString],
     ) -> Result<(Self, flume::Receiver<PtyOutput>), String> {
         allow_ctrl_c_in_children();
-        let input = Pipe::create()?;
-        let output = Pipe::create()?;
+        let input = Pipe::create(0)?;
+        // Buffer bursts while the reader waits on I/O completion or a barrier.
+        let output = Pipe::create_output(256 * 1024)?;
+        let reader_wake = create_event(false)?;
+        let reader_wake_thread = reader_wake.try_clone()?;
+        let read_event = create_event(true)?;
         let api = ConptyApi::global()?;
         let mut pseudoconsole: HPCON = 0;
         let result = unsafe {
@@ -580,11 +668,15 @@ impl PtySession {
         if let Err(error) = std::thread::Builder::new()
             .name("terminal-conpty-reader".into())
             .spawn(move || {
-                let mut buffer = [0_u8; 16 * 1024];
+                let mut buffer = [0_u8; 64 * 1024];
                 loop {
+                    if reader_shutdown.is_disconnected() {
+                        break;
+                    }
                     if !reader_checkpoint(&control_rx, &output_tx, &reader_shutdown, || {
                         drain_available_output(
                             &output_handle,
+                            &read_event,
                             &mut buffer,
                             &output_tx,
                             &reader_events,
@@ -593,16 +685,38 @@ impl PtySession {
                     }) {
                         break;
                     }
-                    if !drain_available_output(
-                        &output_handle,
+                    match read_output_handle(
+                        output_handle.raw(),
                         &mut buffer,
-                        &output_tx,
-                        &reader_events,
-                        &reader_shutdown,
+                        read_event.raw(),
+                        Some(reader_wake_thread.raw()),
                     ) {
-                        break;
+                        Ok(None) => continue,
+                        Ok(Some(0)) => {
+                            let _ = reader_events.lifecycle(TerminalEvent::Exited);
+                            break;
+                        }
+                        Ok(Some(read)) => {
+                            if !send_or_shutdown(
+                                &output_tx,
+                                &reader_shutdown,
+                                PtyOutput::Bytes(buffer[..read].to_vec()),
+                            ) {
+                                break;
+                            }
+                            let _ = reader_events.changed();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                            let _ = reader_events.lifecycle(TerminalEvent::Exited);
+                            break;
+                        }
+                        Err(error) => {
+                            let _ = reader_events.lifecycle(TerminalEvent::Failed(format!(
+                                "ConPTY read stopped: {error}"
+                            )));
+                            break;
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 let _ = output_handle.close();
             })
@@ -648,6 +762,7 @@ impl PtySession {
                 process,
                 process_id,
                 control: control_tx,
+                reader_wake,
                 shutdown: Some(shutdown_tx),
             },
             output_rx,
@@ -677,7 +792,8 @@ impl PtySession {
     pub fn pause_reader(&mut self) -> Result<(), String> {
         self.control
             .send(ReaderControl::Pause)
-            .map_err(|_| "pause ConPTY reader: reader stopped".to_string())
+            .map_err(|_| "pause ConPTY reader: reader stopped".to_string())?;
+        self.wake_reader()
     }
 
     pub fn resume_reader(&mut self) -> Result<(), String> {
@@ -689,7 +805,16 @@ impl PtySession {
     pub fn synchronize_reader(&mut self) -> Result<(), String> {
         self.control
             .send(ReaderControl::Synchronize)
-            .map_err(|_| "synchronize ConPTY reader: reader stopped".to_string())
+            .map_err(|_| "synchronize ConPTY reader: reader stopped".to_string())?;
+        self.wake_reader()
+    }
+
+    fn wake_reader(&self) -> Result<(), String> {
+        if unsafe { SetEvent(self.reader_wake.raw()) } == 0 {
+            Err(last_error("wake ConPTY reader"))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn reap(&mut self) -> Result<(), String> {
@@ -701,6 +826,7 @@ impl PtySession {
 
 fn drain_available_output(
     output_handle: &OwnedHandle,
+    read_event: &OwnedHandle,
     buffer: &mut [u8],
     output: &flume::Sender<PtyOutput>,
     events: &TerminalEventSender,
@@ -722,7 +848,14 @@ fn drain_available_output(
             }
         };
         let read_len = available.min(buffer.len());
-        match read_handle(output_handle.raw(), &mut buffer[..read_len]) {
+        match read_output_handle(
+            output_handle.raw(),
+            &mut buffer[..read_len],
+            read_event.raw(),
+            None,
+        )
+        .map(|read| read.expect("uninterrupted pipe read"))
+        {
             Ok(0) => {
                 let _ = events.lifecycle(TerminalEvent::Exited);
                 return false;
@@ -768,6 +901,7 @@ impl Drop for PtySession {
         // worker blocked while publishing output or a lifecycle event then
         // cancels its send and releases its pipe handle.
         drop(self.shutdown.take());
+        let _ = self.wake_reader();
         unsafe {
             TerminateProcess(self.process.raw(), 0);
         }
@@ -785,7 +919,73 @@ impl PtySize {
 }
 
 impl Pipe {
-    fn create() -> Result<Self, String> {
+    /// The ConPTY endpoint remains synchronous. Only our read endpoint uses
+    /// overlapped I/O, so output and reader barriers can wake the same wait.
+    fn create_output(buffer_bytes: u32) -> Result<Self, String> {
+        static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let name: Vec<u16> = format!(
+            r"\\.\pipe\agent-terminal-{}-{nonce}-{sequence}",
+            std::process::id()
+        )
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+        let read = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                0,
+                buffer_bytes,
+                0,
+                null_mut(),
+            )
+        };
+        if read == INVALID_HANDLE_VALUE {
+            return Err(last_error("create ConPTY output pipe"));
+        }
+        let read = OwnedHandle(read);
+        let write = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+        if write == INVALID_HANDLE_VALUE {
+            return Err(last_error("open ConPTY output pipe"));
+        }
+        let write = OwnedHandle(write);
+        // The client connected above. ConnectNamedPipe reports that successful
+        // preconnection with ERROR_PIPE_CONNECTED; no pending connect is left.
+        let mut overlapped = OVERLAPPED::default();
+        if unsafe { ConnectNamedPipe(read.raw(), &mut overlapped) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                if error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+                    unsafe {
+                        CancelIoEx(read.raw(), &overlapped);
+                        let mut ignored = 0;
+                        GetOverlappedResult(read.raw(), &overlapped, &mut ignored, 1);
+                    }
+                }
+                return Err(format!("connect ConPTY output pipe: {error}"));
+            }
+        }
+        Ok(Self { read, write })
+    }
+
+    fn create(buffer_bytes: u32) -> Result<Self, String> {
         let mut read = INVALID_HANDLE_VALUE;
         let mut write = INVALID_HANDLE_VALUE;
         let attributes = SECURITY_ATTRIBUTES {
@@ -793,7 +993,7 @@ impl Pipe {
             lpSecurityDescriptor: null_mut(),
             bInheritHandle: 0,
         };
-        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+        if unsafe { CreatePipe(&mut read, &mut write, &attributes, buffer_bytes) } == 0 {
             return Err(last_error("create ConPTY pipe"));
         }
         Ok(Self {
@@ -1135,7 +1335,31 @@ fn nul_terminated(value: &OsStr, field: &str) -> Result<Vec<u16>, String> {
     Ok(value)
 }
 
-fn read_handle(handle: HANDLE, buffer: &mut [u8]) -> io::Result<usize> {
+fn create_event(manual_reset: bool) -> Result<OwnedHandle, String> {
+    let handle = unsafe { CreateEventW(null_mut(), i32::from(manual_reset), 0, null_mut()) };
+    if handle.is_null() {
+        Err(last_error("create ConPTY reader event"))
+    } else {
+        Ok(OwnedHandle(handle))
+    }
+}
+
+/// Keep the OVERLAPPED and buffer alive until completion, even when a barrier
+/// cancels the read. If cancellation races successful completion, publish those
+/// bytes before handling the barrier on the next reader iteration.
+fn read_output_handle(
+    handle: HANDLE,
+    buffer: &mut [u8],
+    event: HANDLE,
+    wake: Option<HANDLE>,
+) -> io::Result<Option<usize>> {
+    if unsafe { ResetEvent(event) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut overlapped = OVERLAPPED {
+        hEvent: event,
+        ..Default::default()
+    };
     let mut read = 0;
     let result = unsafe {
         ReadFile(
@@ -1143,13 +1367,41 @@ fn read_handle(handle: HANDLE, buffer: &mut [u8]) -> io::Result<usize> {
             buffer.as_mut_ptr(),
             buffer.len().min(u32::MAX as usize) as u32,
             &mut read,
-            null_mut(),
+            (&mut overlapped as *mut OVERLAPPED).cast(),
         )
     };
-    if result == 0 {
-        Err(io::Error::last_os_error())
+    if result != 0 {
+        return Ok(Some(read as usize));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+        return Err(error);
+    }
+    let wait = if let Some(wake) = wake {
+        let handles = [event, wake];
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) }
     } else {
-        Ok(read as usize)
+        unsafe { WaitForSingleObject(event, INFINITE) }
+    };
+    let wait_error = (wait == WAIT_FAILED).then(io::Error::last_os_error);
+    if wait != WAIT_OBJECT_0 {
+        unsafe {
+            CancelIoEx(handle, &overlapped);
+        }
+    }
+    // Always wait for the kernel to release the stack OVERLAPPED and buffer.
+    let completed = unsafe { GetOverlappedResult(handle, &overlapped, &mut read, 1) };
+    if completed != 0 {
+        return Ok(Some(read as usize));
+    }
+    let error = io::Error::last_os_error();
+    if let Some(wait_error) = wait_error {
+        return Err(wait_error);
+    }
+    if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) {
+        Ok(None)
+    } else {
+        Err(error)
     }
 }
 
@@ -1229,6 +1481,37 @@ mod tests {
     const PROMPT: &[u8] = b"__CONPTY_PROMPT__";
     const VISIBLE_FRAME: &[u8] = b"__VISIBLE_FRAME_SENTINEL__";
     const POST_RESIZE_BARRIER: &[u8] = b"__POST_RESIZE_BARRIER__";
+
+    #[test]
+    fn idle_pipe_read_cancels_and_preserves_subsequent_bytes() {
+        use super::{Pipe, create_event, read_output_handle, write_handle};
+        let pipe = Pipe::create_output(4096).unwrap();
+        let event = create_event(true).unwrap();
+        let wake = create_event(false).unwrap();
+        let mut buffer = [0; 64];
+        // A barrier arriving before ReadFile starts must still wake the pending
+        // read, and cancellation must finish before the buffer can be reused.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetEvent(wake.raw());
+        }
+        assert_eq!(
+            read_output_handle(pipe.read.raw(), &mut buffer, event.raw(), Some(wake.raw()))
+                .unwrap(),
+            None
+        );
+        write_handle(pipe.write.raw(), b"after cancellation").unwrap();
+        let read = read_output_handle(pipe.read.raw(), &mut buffer, event.raw(), Some(wake.raw()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..read], b"after cancellation");
+        drop(pipe.write);
+        assert_eq!(
+            read_output_handle(pipe.read.raw(), &mut buffer, event.raw(), Some(wake.raw()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn integration_shell_disables_user_configuration_and_persistent_history() {

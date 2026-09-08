@@ -1,6 +1,8 @@
 mod core_model;
 mod ghostty;
+mod terminal_image;
 mod terminal_link;
+pub use terminal_image::TerminalImage;
 
 #[cfg(feature = "gui")]
 mod agent_integration;
@@ -87,3 +89,5 @@ pub fn headless_smoke() {
     );
     print!("{text}");
 }
+
+pub mod terminal_download;

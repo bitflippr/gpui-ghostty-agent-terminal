@@ -1,0 +1,2860 @@
+diff --git a/include/ghostty/vt/kitty_graphics.h b/include/ghostty/vt/kitty_graphics.h
+index dda8b836e..388659c31 100644
+--- a/include/ghostty/vt/kitty_graphics.h
++++ b/include/ghostty/vt/kitty_graphics.h
+@@ -19,6 +19,10 @@
+ extern "C" {
+ #endif
+ 
++/** Advance animation state. now_ms must come from a monotonic clock. */
++GHOSTTY_API GhosttyResult ghostty_kitty_graphics_tick(GhosttyTerminal terminal, uint64_t now_ms, bool* changed);
++
++
+ /** @defgroup kitty_graphics Kitty Graphics
+  *
+  * API for inspecting images and placements stored via the
+@@ -474,6 +478,12 @@ typedef struct {
+   uint32_t source_height;
+ } GhosttyKittyGraphicsPlacementRenderInfo;
+ 
++/** Visit resolved Unicode image fragments. Callback data is borrowed. */
++typedef void (*GhosttyKittyVirtualPlacementCallback)(void* userdata, uint32_t image_id,
++    const GhosttyKittyGraphicsPlacementRenderInfo* info, uint32_t offset_x, uint32_t offset_y);
++GHOSTTY_API GhosttyResult ghostty_kitty_graphics_visit_virtual(GhosttyTerminal terminal,
++    void* userdata, GhosttyKittyVirtualPlacementCallback callback);
++
+ /**
+  * Get data from a kitty graphics storage instance.
+  *
+diff --git a/include/ghostty/vt/osc.h b/include/ghostty/vt/osc.h
+index 9409ebc73..ceec28231 100644
+--- a/include/ghostty/vt/osc.h
++++ b/include/ghostty/vt/osc.h
+@@ -63,6 +63,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
+   GHOSTTY_OSC_COMMAND_CONEMU_XTERM_EMULATION = 20,
+   GHOSTTY_OSC_COMMAND_CONEMU_COMMENT = 21,
+   GHOSTTY_OSC_COMMAND_KITTY_TEXT_SIZING = 22,
++  GHOSTTY_OSC_COMMAND_ITERM_IMAGE = 26,
+   GHOSTTY_OSC_COMMAND_TYPE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttyOscCommandType;
+ 
+diff --git a/include/ghostty/vt/sys.h b/include/ghostty/vt/sys.h
+index ae9059692..8abbac341 100644
+--- a/include/ghostty/vt/sys.h
++++ b/include/ghostty/vt/sys.h
+@@ -124,6 +124,27 @@ typedef bool (*GhosttySysDecodePngFn)(
+     size_t data_len,
+     GhosttySysImage* out);
+ 
++/** Every decoded frame is a complete RGBA canvas. All buffers, including
++ * frames, use the supplied allocator and transfer to the library on success. */
++typedef struct { uint8_t* data; size_t data_len; uint32_t gap_ms; } GhosttySysAnimationFrame;
++typedef struct {
++    uint32_t width, height;
++    GhosttySysAnimationFrame* frames;
++    size_t frames_len;
++    /** Zero loops forever; positive values are the total number of plays. */
++    uint32_t loops;
++    /** Optional deferred decoder, owned by the library after success.
++     * next returns 0=pending, 1=owned frame, 2=end, -1=error, and never waits.
++     * source_bytes accounts for retained input and bounded decode-ahead buffers.
++     * free cancels and releases the source, including when an image is deleted.
++     * Both callbacks run serially with other operations on this terminal. */
++    void* source;
++    size_t source_bytes;
++    int32_t (*source_next)(void*, const GhosttyAllocator*, GhosttySysAnimationFrame*);
++    void (*source_free)(void*);
++} GhosttySysAnimation;
++typedef bool (*GhosttySysDecodeImageFn)(void*, const GhosttyAllocator*, const uint8_t*, size_t, GhosttySysAnimation*);
++
+ /**
+  * System option identifiers for ghostty_sys_set().
+  */
+@@ -165,6 +186,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
+      * Input type: GhosttySysLogFn (function pointer, or NULL)
+      */
+     GHOSTTY_SYS_OPT_LOG = 2,
++    /** General raster decoder for iTerm2 images. Input: GhosttySysDecodePngFn. */
++    GHOSTTY_SYS_OPT_DECODE_IMAGE = 3,
+     GHOSTTY_SYS_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttySysOption;
+ 
+diff --git a/include/ghostty/vt/terminal.h b/include/ghostty/vt/terminal.h
+index 8470607b3..22e1c1ae6 100644
+--- a/include/ghostty/vt/terminal.h
++++ b/include/ghostty/vt/terminal.h
+@@ -888,6 +888,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
+    * Input type: GhosttyTerminalClipboardWriteFn
+    */
+   GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE = 26,
++  /** Decoded iTerm2 download. Both strings are borrowed for the callback. */
++  GHOSTTY_TERMINAL_OPT_FILE_DOWNLOAD = 27,
+   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ } GhosttyTerminalOption;
+ 
+diff --git a/src/lib_vt.zig b/src/lib_vt.zig
+index b4a2722bf..78326ad1e 100644
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -311,6 +311,8 @@ comptime {
+         @export(&c.kitty_graphics_placement_viewport_pos, .{ .name = "ghostty_kitty_graphics_placement_viewport_pos" });
+         @export(&c.kitty_graphics_placement_source_rect, .{ .name = "ghostty_kitty_graphics_placement_source_rect" });
+         @export(&c.kitty_graphics_placement_render_info, .{ .name = "ghostty_kitty_graphics_placement_render_info" });
++        @export(&c.kitty_graphics_tick, .{ .name = "ghostty_kitty_graphics_tick" });
++        @export(&c.kitty_graphics_visit_virtual, .{ .name = "ghostty_kitty_graphics_visit_virtual" });
+         @export(&c.grid_ref_cell, .{ .name = "ghostty_grid_ref_cell" });
+         @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
+         @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
+diff --git a/src/terminal/c/kitty_graphics.zig b/src/terminal/c/kitty_graphics.zig
+index 626cc7703..625d4ed80 100644
+--- a/src/terminal/c/kitty_graphics.zig
++++ b/src/terminal/c/kitty_graphics.zig
+@@ -546,6 +546,55 @@ pub const PlacementRenderInfo = extern struct {
+     source_height: u32 = 0,
+ };
+ 
++/// Advance image animations using an embedder-provided monotonic millisecond clock.
++pub fn tick(terminal_: terminal_c.Terminal, now_ms: u64, out_changed: ?*bool) callconv(lib.calling_conv) Result {
++    if (comptime !build_options.kitty_graphics) return .no_value;
++    const wrapper = terminal_ orelse return .invalid_value;
++    const output = out_changed orelse return .invalid_value;
++    const t = wrapper.terminal;
++    const animation = @import("../kitty/graphics_animation.zig");
++    const primary = if (t.screens.get(.primary)) |screen| animation.tick(t.io(), t.gpa(), &screen.kitty_images, now_ms) else false;
++    const alternate = if (t.screens.get(.alternate)) |screen| animation.tick(t.io(), t.gpa(), &screen.kitty_images, now_ms) else false;
++    output.* = primary or alternate;
++    return .success;
++}
++
++pub const VirtualPlacementCallback = *const fn (?*anyopaque, u32, *const PlacementRenderInfo, u32, u32) callconv(lib.calling_conv) void;
++
++/// Visit resolved Unicode placeholder fragments in the active viewport.
++/// Borrowed callback values are valid only until the callback returns.
++pub fn visit_virtual(terminal_: terminal_c.Terminal, userdata: ?*anyopaque, callback: ?VirtualPlacementCallback) callconv(lib.calling_conv) Result {
++    if (comptime !build_options.kitty_graphics) return .no_value;
++    const wrapper = terminal_ orelse return .invalid_value;
++    const visit = callback orelse return .invalid_value;
++    const t = wrapper.terminal;
++    const storage = &t.screens.active.kitty_images;
++    const top = t.screens.active.pages.getTopLeft(.viewport);
++    const bot = t.screens.active.pages.getBottomRight(.viewport) orelse return .success;
++    const cell_w = @max(1, t.width_px / t.cols);
++    const cell_h = @max(1, t.height_px / t.rows);
++    var iter = @import("../kitty/graphics_unicode.zig").placementIterator(top, bot);
++    while (iter.next()) |p| {
++        const img = storage.imageById(p.image_id) orelse continue;
++        const rp = p.renderPlacement(storage, &img, cell_w, cell_h) catch continue;
++        if (rp.dest_width == 0 or rp.dest_height == 0) continue;
++        const position = t.screens.active.pages.pointFromPin(.viewport, rp.top_left) orelse continue;
++        const info: PlacementRenderInfo = .{
++            .pixel_width = rp.dest_width,
++            .pixel_height = rp.dest_height,
++            .viewport_col = @intCast(rp.top_left.x),
++            .viewport_row = @intCast(position.viewport.y),
++            .viewport_visible = true,
++            .source_x = rp.source_x,
++            .source_y = rp.source_y,
++            .source_width = rp.source_width,
++            .source_height = rp.source_height,
++        };
++        visit(userdata, p.image_id, &info, rp.offset_x, rp.offset_y);
++    }
++    return .success;
++}
++
+ pub fn placement_render_info(
+     iter_: PlacementIterator,
+     image_: ImageHandle,
+@@ -605,17 +654,12 @@ fn computeViewportPos(
+ ) struct { col: i32, row: i32, visible: bool } {
+     // Virtual placements use unicode placeholders and don't have a
+     // screen position — they are rendered inline by the text layout.
+-    const pin = switch (p.location) {
+-        .pin => |pin| pin,
+-        .virtual => return .{ .col = 0, .row = 0, .visible = false },
+-    };
++    const origin = p.screenPosition(t, 0) orelse return .{ .col = 0, .row = 0, .visible = false };
+ 
+     // Convert both the placement's pin and the viewport's top-left
+     // corner to screen-absolute coordinates so we can subtract them
+     // to get viewport-relative coordinates.
+     const pages = &t.screens.active.pages;
+-    const pin_screen = pages.pointFromPin(.screen, pin.*) orelse
+-        return .{ .col = 0, .row = 0, .visible = false };
+     const vp_tl = pages.getTopLeft(.viewport);
+     const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse
+         return .{ .col = 0, .row = 0, .visible = false };
+@@ -623,17 +667,17 @@ fn computeViewportPos(
+     // Subtracting viewport origin from the pin gives us viewport-
+     // relative coordinates. The row can be negative when the
+     // placement has partially scrolled above the viewport.
+-    const vp_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
+-        @as(i32, @intCast(vp_screen.screen.y));
+-    const vp_col: i32 = @intCast(pin_screen.screen.x);
++    const vp_row = std.math.cast(i32, origin.y - @as(i64, @intCast(vp_screen.screen.y))) orelse
++        return .{ .col = 0, .row = 0, .visible = false };
++    const vp_col = std.math.cast(i32, origin.x) orelse return .{ .col = 0, .row = 0, .visible = false };
+ 
+     // A placement is invisible if its bottom edge (row + height)
+     // is above the viewport, or its top edge is at or below the
+     // viewport's last row.
+     const grid_size = p.gridSize(image.*, t);
+-    const rows_i32: i32 = @intCast(grid_size.rows);
++    const rows_i32: i64 = @intCast(grid_size.rows);
+     const term_rows: i32 = @intCast(t.rows);
+-    const visible = vp_row + rows_i32 > 0 and vp_row < term_rows;
++    const visible = @as(i64, vp_row) + rows_i32 > 0 and vp_row < term_rows and @as(i64, vp_col) + grid_size.cols > 0 and vp_col < t.cols;
+ 
+     return .{ .col = vp_col, .row = vp_row, .visible = visible };
+ }
+diff --git a/src/terminal/c/main.zig b/src/terminal/c/main.zig
+index 37dc57684..c9450d5a7 100644
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -27,6 +27,8 @@ pub const kitty_graphics_placement_grid_size = kitty_graphics.placement_grid_siz
+ pub const kitty_graphics_placement_viewport_pos = kitty_graphics.placement_viewport_pos;
+ pub const kitty_graphics_placement_source_rect = kitty_graphics.placement_source_rect;
+ pub const kitty_graphics_placement_render_info = kitty_graphics.placement_render_info;
++pub const kitty_graphics_tick = kitty_graphics.tick;
++pub const kitty_graphics_visit_virtual = kitty_graphics.visit_virtual;
+ pub const types = @import("types.zig");
+ pub const modes = @import("modes.zig");
+ pub const osc = @import("osc.zig");
+diff --git a/src/terminal/c/sys.zig b/src/terminal/c/sys.zig
+index 0cf0c6e3b..1fb6e36fa 100644
+--- a/src/terminal/c/sys.zig
++++ b/src/terminal/c/sys.zig
+@@ -22,6 +22,20 @@ pub const DecodePngFn = *const fn (
+     *Image,
+ ) callconv(lib.calling_conv) bool;
+ 
++pub const AnimationFrame = extern struct { data: ?[*]u8, data_len: usize, gap_ms: u32 };
++pub const Animation = extern struct {
++    width: u32,
++    height: u32,
++    frames: ?[*]align(1) AnimationFrame,
++    frames_len: usize,
++    loops: u32,
++    source: ?*anyopaque = null,
++    source_bytes: usize = 0,
++    source_next: ?*const fn (*anyopaque, *const CAllocator, *AnimationFrame) callconv(lib.calling_conv) i32 = null,
++    source_free: ?*const fn (*anyopaque) callconv(lib.calling_conv) void = null,
++};
++pub const DecodeImageFn = *const fn (?*anyopaque, *const CAllocator, [*]const u8, usize, *Animation) callconv(lib.calling_conv) bool;
++
+ /// C: GhosttySysLogLevel
+ pub const LogLevel = enum(c_int) {
+     @"error" = 0,
+@@ -54,11 +68,13 @@ pub const Option = enum(c_int) {
+     userdata = 0,
+     decode_png = 1,
+     log = 2,
++    decode_image = 3,
+ 
+     pub fn InType(comptime self: Option) type {
+         return switch (self) {
+             .userdata => ?*const anyopaque,
+             .decode_png => ?DecodePngFn,
++            .decode_image => ?DecodeImageFn,
+             .log => ?LogFn,
+         };
+     }
+@@ -69,6 +85,7 @@ pub const Option = enum(c_int) {
+ const Global = struct {
+     userdata: ?*anyopaque = null,
+     decode_png: ?DecodePngFn = null,
++    decode_image: ?DecodeImageFn = null,
+     log: ?LogFn = null,
+ };
+ 
+@@ -97,6 +114,73 @@ fn decodePngWrapper(
+     };
+ }
+ 
++fn decodeImageWrapper(alloc: std.mem.Allocator, data: []const u8) terminal_sys.DecodeError!terminal_sys.Animation {
++    const func = global.decode_image orelse return error.InvalidData;
++    const c_alloc = CAllocator.fromZig(&alloc);
++    var out: Animation = undefined;
++    if (!func(global.userdata, &c_alloc, data.ptr, data.len, &out)) return error.InvalidData;
++    var own_source = true;
++    defer if (own_source) {
++        if (out.source) |source| {
++            if (out.source_free) |free| free(source);
++        }
++    };
++    const raw = (out.frames orelse return error.InvalidData)[0..out.frames_len];
++    defer alloc.free(raw);
++    var own_pixels = true;
++    defer if (own_pixels) {
++        for (raw) |frame| if (frame.data) |pixels| alloc.free(pixels[0..frame.data_len]);
++    };
++    if (out.width == 0 or out.height == 0 or out.width > 16384 or out.height > 16384 or raw.len == 0 or raw.len > 4096) return error.InvalidData;
++    const expected = @as(usize, out.width) * out.height * 4;
++    if (expected > 256 * 1024 * 1024 / raw.len) return error.InvalidData;
++    const frames = try alloc.alloc(terminal_sys.Animation.Frame, raw.len);
++    errdefer alloc.free(frames);
++    for (raw, frames) |source, *dest| {
++        const pixels = source.data orelse return error.InvalidData;
++        if (source.data_len != expected) return error.InvalidData;
++        dest.* = .{ .data = pixels[0..source.data_len], .gap_ms = source.gap_ms };
++    }
++    var source: ?terminal_sys.Animation.Source = null;
++    if (out.source != null) {
++        if (out.source_next == null or out.source_free == null or out.source_bytes > 256 * 1024 * 1024) return error.InvalidData;
++        const held = try alloc.create(DeferredSource);
++        held.* = .{ .raw = out, .expected = expected };
++        source = .{ .context = held, .retained_bytes = out.source_bytes, .next = DeferredSource.next, .destroy = DeferredSource.destroy };
++    }
++    own_source = false;
++    own_pixels = false;
++    return .{ .width = out.width, .height = out.height, .frames = frames, .loops = out.loops, .source = source };
++}
++
++const DeferredSource = struct {
++    raw: Animation,
++    expected: usize,
++    fn next(alloc: std.mem.Allocator, context: *anyopaque) terminal_sys.DecodeError!terminal_sys.Animation.Source.Poll {
++        const self: *DeferredSource = @ptrCast(@alignCast(context));
++        const c_alloc = CAllocator.fromZig(&alloc);
++        var frame: AnimationFrame = undefined;
++        switch (self.raw.source_next.?(self.raw.source.?, &c_alloc, &frame)) {
++            0 => return .pending,
++            2 => return .done,
++            1 => {
++                const pixels = frame.data orelse return error.InvalidData;
++                if (frame.data_len != self.expected) {
++                    alloc.free(pixels[0..frame.data_len]);
++                    return error.InvalidData;
++                }
++                return .{ .frame = .{ .data = pixels[0..frame.data_len], .gap_ms = frame.gap_ms } };
++            },
++            else => return error.InvalidData,
++        }
++    }
++    fn destroy(alloc: std.mem.Allocator, context: *anyopaque) void {
++        const self: *DeferredSource = @ptrCast(@alignCast(context));
++        self.raw.source_free.?(self.raw.source.?);
++        alloc.destroy(self);
++    }
++};
++
+ pub fn set(
+     option: Option,
+     value: ?*const anyopaque,
+@@ -121,6 +205,10 @@ fn setTyped(
+ ) Result {
+     switch (option) {
+         .userdata => global.userdata = @constCast(value),
++        .decode_image => {
++            global.decode_image = value;
++            terminal_sys.decode_image = if (value != null) &decodeImageWrapper else null;
++        },
+         .decode_png => {
+             global.decode_png = value;
+             terminal_sys.decode_png = if (value != null) &decodePngWrapper else null;
+diff --git a/src/terminal/c/terminal.zig b/src/terminal/c/terminal.zig
+index 195dd94dd..a98cdda68 100644
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -96,6 +96,7 @@ const Effects = struct {
+     pwd_changed: ?PwdChangedFn = null,
+     size_cb: ?SizeFn = null,
+     clipboard_write: ?ClipboardWriteFn = null,
++    file_download: ?FileDownloadFn = null,
+ 
+     /// Scratch buffer for DA1 feature codes. The device attributes
+     /// trampoline converts C feature codes into this buffer and returns
+@@ -105,6 +106,8 @@ const Effects = struct {
+     da_features_buf: [64]device_attributes.Primary.Feature = undefined,
+ 
+     /// C function pointer type for the write_pty callback.
++    pub const FileDownloadFn = *const fn (Terminal, ?*anyopaque, lib.String, lib.String) callconv(lib.calling_conv) void;
++
+     pub const WritePtyFn = *const fn (Terminal, ?*anyopaque, [*]const u8, usize) callconv(lib.calling_conv) void;
+ 
+     /// C function pointer type for the bell callback.
+@@ -176,6 +179,12 @@ const Effects = struct {
+         func(@ptrCast(wrapper), wrapper.effects.userdata, data.ptr, data.len);
+     }
+ 
++    fn fileDownloadTrampoline(handler: *Handler, name: []const u8, data: []const u8) void {
++        const wrapper = TerminalWrapper.fromHandler(handler);
++        const func = wrapper.effects.file_download orelse return;
++        func(@ptrCast(wrapper), wrapper.effects.userdata, .{ .ptr = name.ptr, .len = name.len }, .{ .ptr = data.ptr, .len = data.len });
++    }
++
+     fn bellTrampoline(handler: *Handler) void {
+         const wrapper = TerminalWrapper.fromHandler(handler);
+         const func = wrapper.effects.bell orelse return;
+@@ -389,6 +398,7 @@ fn new_(
+         .pwd_changed = &Effects.pwdChangedTrampoline,
+         .size = &Effects.sizeTrampoline,
+         .clipboard_write = &Effects.clipboardWriteTrampoline,
++        .file_download = &Effects.fileDownloadTrampoline,
+     };
+ 
+     wrapper.* = .{
+@@ -461,6 +471,7 @@ pub const Option = enum(c_int) {
+     glyph_protocol = 24,
+     pwd_changed = 25,
+     clipboard_write = 26,
++    file_download = 27,
+ 
+     /// Input type expected for setting the option.
+     pub fn InType(comptime self: Option) type {
+@@ -476,6 +487,7 @@ pub const Option = enum(c_int) {
+             .pwd_changed => ?Effects.PwdChangedFn,
+             .size_cb => ?Effects.SizeFn,
+             .clipboard_write => ?Effects.ClipboardWriteFn,
++            .file_download => ?Effects.FileDownloadFn,
+             .title, .pwd => ?*const lib.String,
+             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
+             .color_palette => ?*const color.PaletteC,
+@@ -533,6 +545,7 @@ fn setTyped(
+         .pwd_changed => wrapper.effects.pwd_changed = value,
+         .size_cb => wrapper.effects.size_cb = value,
+         .clipboard_write => wrapper.effects.clipboard_write = value,
++        .file_download => wrapper.effects.file_download = value,
+         .title => {
+             const str = if (value) |v| v.ptr[0..v.len] else "";
+             wrapper.terminal.setTitle(str) catch return .out_of_memory;
+diff --git a/src/terminal/kitty/graphics_command.zig b/src/terminal/kitty/graphics_command.zig
+index ce791072b..88227a5d7 100644
+--- a/src/terminal/kitty/graphics_command.zig
++++ b/src/terminal/kitty/graphics_command.zig
+@@ -222,6 +222,10 @@ pub const Parser = struct {
+ 
+         return .{
+             .control = control,
++            .explicit_action = self.kv.contains('a'),
++            .request_id = self.kv.get('i') orelse 0,
++            .request_number = self.kv.get('I') orelse 0,
++            .conflicting_ids = (self.kv.get('i') orelse 0) != 0 and (self.kv.get('I') orelse 0) != 0,
+             .quiet = quiet,
+             .data = try self.decodeData(alloc),
+         };
+@@ -344,6 +348,10 @@ pub const Response = struct {
+ 
+ pub const Command = struct {
+     control: Control,
++    explicit_action: bool = true,
++    conflicting_ids: bool = false,
++    request_id: u32 = 0,
++    request_number: u32 = 0,
+     quiet: Quiet = .no,
+     data: []const u8 = "",
+ 
+@@ -392,6 +400,7 @@ pub const Command = struct {
+             .query => |t| t,
+             .transmit => |t| t,
+             .transmit_and_display => |t| t.transmission,
++            .transmit_animation_frame => |t| t.transmission,
+             else => null,
+         };
+     }
+@@ -667,11 +676,12 @@ pub const Display = struct {
+ };
+ 
+ pub const AnimationFrameLoading = struct {
++    transmission: Transmission = .{},
+     x: u32 = 0, // x
+     y: u32 = 0, // y
+     create_frame: u32 = 0, // c
+     edit_frame: u32 = 0, // r
+-    gap_ms: u32 = 0, // z
++    gap_ms: i32 = 0, // z
+     composition_mode: CompositionMode = .alpha_blend, // X
+     background: Background = .{}, // Y
+ 
+@@ -683,7 +693,7 @@ pub const AnimationFrameLoading = struct {
+     };
+ 
+     fn parse(kv: KV) !AnimationFrameLoading {
+-        var result: AnimationFrameLoading = .{};
++        var result: AnimationFrameLoading = .{ .transmission = try Transmission.parse(kv) };
+ 
+         if (kv.get('x')) |v| {
+             result.x = v;
+@@ -702,7 +712,7 @@ pub const AnimationFrameLoading = struct {
+         }
+ 
+         if (kv.get('z')) |v| {
+-            result.gap_ms = v;
++            result.gap_ms = @bitCast(v);
+         }
+ 
+         if (kv.get('X')) |v| {
+@@ -714,7 +724,7 @@ pub const AnimationFrameLoading = struct {
+         }
+ 
+         if (kv.get('Y')) |v| {
+-            result.background = @bitCast(v);
++            result.background = .{ .r = @truncate(v >> 24), .g = @truncate(v >> 16), .b = @truncate(v >> 8), .a = @truncate(v) };
+         }
+ 
+         return result;
+@@ -722,6 +732,8 @@ pub const AnimationFrameLoading = struct {
+ };
+ 
+ pub const AnimationFrameComposition = struct {
++    image_id: u32 = 0,
++    image_number: u32 = 0,
+     frame: u32 = 0, // c
+     edit_frame: u32 = 0, // r
+     x: u32 = 0, // x
+@@ -733,7 +745,7 @@ pub const AnimationFrameComposition = struct {
+     composition_mode: CompositionMode = .alpha_blend, // C
+ 
+     fn parse(kv: KV) !AnimationFrameComposition {
+-        var result: AnimationFrameComposition = .{};
++        var result: AnimationFrameComposition = .{ .image_id = kv.get('i') orelse 0, .image_number = kv.get('I') orelse 0 };
+ 
+         if (kv.get('c')) |v| {
+             result.frame = v;
+@@ -780,9 +792,11 @@ pub const AnimationFrameComposition = struct {
+ };
+ 
+ pub const AnimationControl = struct {
++    image_id: u32 = 0,
++    image_number: u32 = 0,
+     action: AnimationAction = .invalid, // s
+     frame: u32 = 0, // r
+-    gap_ms: u32 = 0, // z
++    gap_ms: i32 = 0, // z
+     current_frame: u32 = 0, // c
+     loops: u32 = 0, // v
+ 
+@@ -794,7 +808,7 @@ pub const AnimationControl = struct {
+     };
+ 
+     fn parse(kv: KV) !AnimationControl {
+-        var result: AnimationControl = .{};
++        var result: AnimationControl = .{ .image_id = kv.get('i') orelse 0, .image_number = kv.get('I') orelse 0 };
+ 
+         if (kv.get('s')) |v| {
+             result.action = switch (v) {
+@@ -811,7 +825,7 @@ pub const AnimationControl = struct {
+         }
+ 
+         if (kv.get('z')) |v| {
+-            result.gap_ms = v;
++            result.gap_ms = @bitCast(v);
+         }
+ 
+         if (kv.get('c')) |v| {
+@@ -848,7 +862,12 @@ pub const Delete = union(enum) {
+     intersect_cursor: bool,
+ 
+     // f/F
+-    animation_frames: bool,
++    animation_frames: struct {
++        delete: bool = false,
++        image_id: u32 = 0,
++        image_number: u32 = 0,
++        frame: u32 = 0,
++    },
+ 
+     // p/P
+     intersect_cell: struct {
+@@ -926,7 +945,7 @@ pub const Delete = union(enum) {
+ 
+             'c', 'C' => .{ .intersect_cursor = what == 'C' },
+ 
+-            'f', 'F' => .{ .animation_frames = what == 'F' },
++            'f', 'F' => .{ .animation_frames = .{ .delete = what == 'F', .image_id = kv.get('i') orelse 0, .image_number = kv.get('I') orelse 0, .frame = kv.get('r') orelse 0 } },
+ 
+             'p', 'P' => blk: {
+                 var result: Delete = .{ .intersect_cell = .{ .delete = what == 'P' } };
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index e0756ccc7..56ed9c659 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -12,6 +12,7 @@ const Image = image.Image;
+ const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+ 
+ const log = std.log.scoped(.kitty_gfx);
++const animation = @import("graphics_animation.zig");
+ 
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+@@ -34,6 +35,21 @@ pub fn execute(
+         return null;
+     }
+ 
++    if (cmd.conflicting_ids) {
++        if (cmd.quiet == .failures) return null;
++        return .{ .id = cmd.request_id, .image_number = cmd.request_number, .message = "EINVAL: image ID and number are mutually exclusive" };
++    }
++    if (!cmd.explicit_action and cmd.control == .transmit) {
++        if (terminal.screens.active.kitty_images.loading) |pending| {
++            if (pending.animation_frame != null) {
++                var continuation = cmd.*;
++                continuation.explicit_action = true;
++                continuation.control = .{ .transmit_animation_frame = .{ .transmission = cmd.control.transmit } };
++                return execute(io, alloc, terminal, &continuation);
++            }
++        }
++    }
++
+     log.debug("executing kitty graphics command: quiet={} control={}", .{
+         cmd.quiet,
+         cmd.control,
+@@ -49,7 +65,7 @@ pub fn execute(
+         .display => display(io, alloc, terminal, cmd),
+         .delete => delete(io, alloc, terminal, cmd),
+ 
+-        .transmit, .transmit_and_display => resp: {
++        .transmit, .transmit_and_display, .transmit_animation_frame => resp: {
+             // If we're transmitting, then our `q` setting value is complicated.
+             // The `q` setting inherits the value from the starting command
+             // unless `q` is set >= 1 on this command. If it is, then we save
+@@ -66,13 +82,15 @@ pub fn execute(
+                 },
+             };
+ 
++            if (cmd.control == .transmit_animation_frame) {
++                const t = if (storage.loading) |loading| loading.animation_frame orelse cmd.control.transmit_animation_frame else cmd.control.transmit_animation_frame;
++                break :resp animation.transmit(io, alloc, terminal, cmd) catch |err| animationError(t.transmission.image_id, t.transmission.image_number, err);
++            }
+             break :resp transmit(io, alloc, terminal, cmd);
+         },
+ 
+-        .transmit_animation_frame,
+-        .control_animation,
+-        .compose_animation,
+-        => .{ .message = "ERROR: unimplemented action" },
++        .control_animation => |settings| animation.control(io, alloc, terminal, settings) catch |err| animationError(settings.image_id, settings.image_number, err),
++        .compose_animation => |settings| animation.compose(io, alloc, terminal, settings) catch |err| animationError(settings.image_id, settings.image_number, err),
+     };
+ 
+     // Handle the quiet settings
+@@ -90,6 +108,17 @@ pub fn execute(
+ 
+     return null;
+ }
++fn animationError(id: u32, number: u32, err: anyerror) Response {
++    var response: Response = .{ .id = id, .image_number = number };
++    response.message = switch (err) {
++        error.ImageNotFound => "ENOENT: image or frame not found",
++        error.StorageFull => "ENOSPC: animation storage limit exceeded",
++        error.OutOfMemory => "ENOMEM: allocation failed",
++        else => "EINVAL: invalid animation data",
++    };
++    return response;
++}
++
+ /// Execute a "query" command.
+ ///
+ /// This command is used to attempt to load an image and respond with
+@@ -123,8 +152,12 @@ fn query(
+         encodeError(&result, err);
+         return result;
+     };
+-    loading.deinit(alloc);
+-
++    defer loading.deinit(alloc);
++    var decoded = loading.complete(alloc) catch |err| {
++        encodeError(&result, err);
++        return result;
++    };
++    decoded.deinit(alloc);
+     return result;
+ }
+ 
+@@ -216,6 +249,41 @@ fn display(
+     // Make sure our response has the image id in case we looked up by number
+     result.id = img.id;
+ 
++    if (d.x >= img.width or d.y >= img.height) return result;
++    if (d.columns > 65535 or d.rows > 65535) {
++        result.message = "EINVAL: placement dimensions exceed limit";
++        return result;
++    }
++    var parent_key: ?ImageStorage.PlacementKey = null;
++    if (d.parent_id != 0) {
++        if (d.virtual_placement) {
++            result.message = "EINVAL: virtual placement cannot be relative";
++            return result;
++        }
++        parent_key = storage.placementKey(d.parent_id, d.parent_placement_id) orelse {
++            result.message = "ENOPARENT: parent placement not found";
++            return result;
++        };
++        var next = parent_key;
++        var depth: usize = 0;
++        while (next) |key| {
++            if (key.image_id == img.id and d.placement_id != 0 and key.placement_id.tag == .external and key.placement_id.id == d.placement_id) {
++                result.message = "ECYCLE: relative placement cycle";
++                return result;
++            }
++            depth += 1;
++            if (depth > 32) {
++                result.message = "ETOODEEP: relative placement chain too long";
++                return result;
++            }
++            const ancestor = storage.placements.getPtr(key) orelse {
++                result.message = "ENOPARENT: parent placement not found";
++                return result;
++            };
++            next = ancestor.parent;
++        }
++    }
++
+     // Location where the placement will go.
+     const location: ImageStorage.Placement.Location = location: {
+         // Virtual placements are not tracked
+@@ -242,13 +310,16 @@ fn display(
+ 
+     // Add the placement
+     const p: ImageStorage.Placement = .{
++        .parent = parent_key,
++        .horizontal_offset = d.horizontal_offset,
++        .vertical_offset = d.vertical_offset,
+         .location = location,
+-        .x_offset = d.x_offset,
+-        .y_offset = d.y_offset,
++        .x_offset = @min(d.x_offset, @max(1, terminal.width_px / terminal.cols) - 1),
++        .y_offset = @min(d.y_offset, @max(1, terminal.height_px / terminal.rows) - 1),
+         .source_x = d.x,
+         .source_y = d.y,
+-        .source_width = d.width,
+-        .source_height = d.height,
++        .source_width = if (d.width == 0) img.width -| d.x else @min(d.width, img.width -| d.x),
++        .source_height = if (d.height == 0) img.height -| d.y else @min(d.height, img.height -| d.y),
+         .columns = d.columns,
+         .rows = d.rows,
+         .z = d.z,
+@@ -256,6 +327,7 @@ fn display(
+     storage.addPlacement(
+         io,
+         alloc,
++        terminal.screens.active,
+         img.id,
+         result.placement_id,
+         p,
+@@ -266,25 +338,22 @@ fn display(
+     };
+ 
+     // Apply cursor movement setting. This only applies to pin placements.
+-    switch (p.location) {
++    if (parent_key == null) switch (p.location) {
+         .virtual => {},
+-        .pin => |pin| switch (d.cursor_movement) {
++        .pin => switch (d.cursor_movement) {
+             .none => {},
+             .after => {
+                 // We use terminal.index to properly handle scroll regions.
+                 const size = p.gridSize(img, terminal);
+-                for (0..size.rows) |_| terminal.index() catch |err| {
++                for (0..@min(size.rows, terminal.rows)) |_| terminal.index() catch |err| {
+                     log.warn("failed to move cursor: {}", .{err});
+                     break;
+                 };
+ 
+-                terminal.setCursorPos(
+-                    terminal.screens.active.cursor.y,
+-                    pin.x + size.cols + 1,
+-                );
++                terminal.cursorRight(size.cols);
+             },
+         },
+-    }
++    };
+ 
+     return result;
+ }
+@@ -343,6 +412,7 @@ fn loadAndAddImage(
+ 
+     // If the image has no ID, we assign one
+     if (loading.image.id == 0) {
++        while (storage.next_image_id == 0 or storage.imageById(storage.next_image_id) != null) storage.next_image_id +%= 1;
+         loading.image.id = storage.next_image_id;
+         storage.next_image_id +%= 1;
+ 
+@@ -369,7 +439,8 @@ fn loadAndAddImage(
+     // Validate and store our image
+     var img = try loading.complete(alloc);
+     errdefer img.deinit(alloc);
+-    try storage.addImage(io, alloc, img);
++    try storage.addImage(io, alloc, terminal.screens.active, img);
++    storage.delete(io, alloc, terminal, .{ .id = .{ .image_id = img.id, .delete = false } });
+ 
+     // Get our display settings
+     const display_ = loading.display;
+diff --git a/src/terminal/kitty/graphics_image.zig b/src/terminal/kitty/graphics_image.zig
+index ef584c09a..a7efd3573 100644
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -33,6 +33,7 @@ pub const LoadingImage = struct {
+     /// This is non-null when a transmit and display command is given
+     /// so that we display the image after it is fully loaded.
+     display: ?command.Display = null,
++    animation_frame: ?command.AnimationFrameLoading = null,
+ 
+     /// Quiet is the quiet settings for the initial load command. This is
+     /// used if q isn't set on subsequent chunks.
+@@ -90,6 +91,11 @@ pub const LoadingImage = struct {
+         // These can be overwritten by the data loading process. For example,
+         // PNG loading sets the width/height from the data.
+         const t = cmd.transmission().?;
++        // The embedder renders RGBA, including when the wire format is RGB.
++        // Enforce the same per-frame bound before reading or allocating media.
++        if (t.format != .png and (t.width > max_dimension or t.height > max_dimension or
++            @as(u64, t.width) * t.height * 4 > 64 * 1024 * 1024)) return error.DimensionsTooLarge;
++        if (t.size > max_size) return error.InvalidData;
+         var result: LoadingImage = .{
+             .image = .{
+                 .id = t.image_id,
+@@ -102,6 +108,7 @@ pub const LoadingImage = struct {
+             },
+ 
+             .display = cmd.display(),
++            .animation_frame = if (cmd.control == .transmit_animation_frame) cmd.control.transmit_animation_frame else null,
+             .quiet = cmd.quiet,
+             .temporary_directory = switch (limits.temporary_file) {
+                 .enabled => |d| d.directory,
+@@ -184,7 +191,10 @@ pub const LoadingImage = struct {
+     ) !void {
+         // android does not support POSIX shared memory.
+         // windows is currently unsupported, does it support shm?
+-        if (comptime builtin.abi.isAndroid() or builtin.target.os.tag == .windows) {
++        if (comptime builtin.target.os.tag == .windows) {
++            return self.readSharedMemoryWindows(alloc, t, path);
++        }
++        if (comptime builtin.abi.isAndroid()) {
+             return error.UnsupportedMedium;
+         }
+ 
+@@ -233,13 +243,13 @@ pub const LoadingImage = struct {
+             // For these formats we have a size we must have.
+             .gray, .gray_alpha, .rgb, .rgba => size: {
+                 const bpp = command.Transmission.formatBpp(self.image.format);
+-                break :size self.image.width * self.image.height * bpp;
++                break :size @as(usize, self.image.width) * self.image.height * bpp;
+             },
+         };
+ 
+         // Our stat size must be at least the expected size otherwise
+         // the shared memory data is invalid.
+-        if (stat_size < expected_size) {
++        if (stat_size < expected_size and t.compression == .none and t.size == 0) {
+             log.warn(
+                 "shared memory size too small expected={} actual={}",
+                 .{ expected_size, stat_size },
+@@ -263,15 +273,47 @@ pub const LoadingImage = struct {
+         // Our end size always uses the expected size so we cut off the
+         // padding for mmap alignment.
+         const start: usize = @intCast(t.offset);
+-        const end: usize = if (t.size > 0) @min(
+-            @as(usize, @intCast(t.offset)) + @as(usize, @intCast(t.size)),
+-            expected_size,
+-        ) else expected_size;
++        const length: usize = if (t.size > 0) t.size else if (t.compression != .none or self.image.format == .png) stat_size -| start else expected_size;
++        if (start > stat_size or length > stat_size - start or length > max_size) return error.InvalidData;
++        const end = start + length;
+ 
+         assert(self.data.items.len == 0);
+         try self.data.appendSlice(alloc, map[start..end]);
+     }
+ 
++    fn readSharedMemoryWindows(self: *LoadingImage, alloc: Allocator, t: command.Transmission, path: []const u8) !void {
++        const Win = struct {
++            const Mbi = extern struct {
++                base: ?*anyopaque,
++                allocation_base: ?*anyopaque,
++                allocation_protect: u32,
++                partition_id: u16,
++                region_size: usize,
++                state: u32,
++                protect: u32,
++                kind: u32,
++            };
++            extern "kernel32" fn OpenFileMappingW(u32, i32, [*:0]const u16) callconv(.winapi) ?*anyopaque;
++            extern "kernel32" fn MapViewOfFile(*anyopaque, u32, u32, u32, usize) callconv(.winapi) ?[*]const u8;
++            extern "kernel32" fn UnmapViewOfFile([*]const u8) callconv(.winapi) i32;
++            extern "kernel32" fn CloseHandle(*anyopaque) callconv(.winapi) i32;
++            extern "kernel32" fn VirtualQuery([*]const u8, *Mbi, usize) callconv(.winapi) usize;
++        };
++        if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidData;
++        const name = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return error.InvalidData;
++        defer alloc.free(name);
++        const handle = Win.OpenFileMappingW(4, 0, name) orelse return error.InvalidData;
++        defer _ = Win.CloseHandle(handle);
++        const view = Win.MapViewOfFile(handle, 4, 0, 0, 0) orelse return error.InvalidData;
++        defer _ = Win.UnmapViewOfFile(view);
++        var info: Win.Mbi = undefined;
++        if (Win.VirtualQuery(view, &info, @sizeOf(Win.Mbi)) == 0) return error.InvalidData;
++        const start: usize = t.offset;
++        const length: usize = if (t.size > 0) t.size else if (t.format == .png or t.compression != .none) info.region_size -| start else @as(usize, t.width) * @as(usize, t.height) * command.Transmission.formatBpp(t.format);
++        if (start > info.region_size or length > info.region_size - start or length > max_size) return error.InvalidData;
++        try self.data.appendSlice(alloc, view[start .. start + length]);
++    }
++
+     /// Reads the data from a temporary file and returns it. This allocates
+     /// and does not free any of the data, so the caller must free it.
+     ///
+@@ -344,7 +386,10 @@ pub const LoadingImage = struct {
+         var managed: std.ArrayList(u8) = .empty;
+         errdefer managed.deinit(alloc);
+         const size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
+-        reader.appendRemaining(alloc, &managed, .limited(size)) catch {
++        if (t.size > 0) {
++            try managed.resize(alloc, size);
++            reader.readSliceAll(managed.items) catch return error.InvalidData;
++        } else reader.appendRemaining(alloc, &managed, .limited(size)) catch {
+             log.warn("failed to read temporary file: {?}", .{buf_reader.err});
+             return error.InvalidData;
+         };
+@@ -357,9 +402,9 @@ pub const LoadingImage = struct {
+     /// Returns true if path appears to be in a temporary directory.
+     /// Copies logic from Kitty.
+     fn isPathInTempDir(io: std.Io, dir: []const u8, path: []const u8) bool {
+-        if (std.mem.startsWith(u8, path, "/tmp")) return true;
+-        if (std.mem.startsWith(u8, path, "/dev/shm")) return true;
+-        if (std.mem.startsWith(u8, path, dir)) return true;
++        if (pathWithin(path, "/tmp")) return true;
++        if (pathWithin(path, "/dev/shm")) return true;
++        if (pathWithin(path, dir)) return true;
+ 
+         // The temporary dir is sometimes a symlink. On macOS for
+         // example /tmp is /private/var/...
+@@ -369,11 +414,18 @@ pub const LoadingImage = struct {
+             dir,
+             &buf,
+         ) catch return false];
+-        if (std.mem.startsWith(u8, path, real_dir)) return true;
++        if (pathWithin(path, real_dir)) return true;
+ 
+         return false;
+     }
+ 
++    fn pathWithin(path: []const u8, directory: []const u8) bool {
++        const dir = std.mem.trimEnd(u8, directory, "/\\");
++        if (path.len <= dir.len) return false;
++        const equal = if (builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(path[0..dir.len], dir) else std.mem.eql(u8, path[0..dir.len], dir);
++        return equal and (path[dir.len] == '/' or (builtin.os.tag == .windows and path[dir.len] == '\\'));
++    }
++
+     pub fn deinit(self: *LoadingImage, alloc: Allocator) void {
+         self.image.deinit(alloc);
+         self.data.deinit(alloc);
+@@ -551,6 +603,14 @@ pub const Image = struct {
+     /// same (e.g. a retransmission of the same ID). Stamps order by
+     /// transmission time. Zero means "never stored".
+     generation: u64 = 0,
++    transmission_generation: u64 = 0,
++    frames: std.ArrayList(Frame) = .empty,
++    source: ?sys.Animation.Source = null,
++    current_frame: usize = 0,
++    animation: command.AnimationControl.AnimationAction = .stop,
++    loops: u32 = 0,
++    completed_loops: u32 = 0,
++    next_frame_ms: ?u64 = null,
+ 
+     /// Set this to true if this image was loaded by a command that
+     /// doesn't specify an ID or number, since such commands should
+@@ -558,6 +618,38 @@ pub const Image = struct {
+     /// IDs in the public range (which is bad!).
+     implicit_id: bool = false,
+ 
++    pub const Frame = sys.Animation.Frame;
++
++    pub fn byteSize(self: Image) usize {
++        if (self.frames.items.len == 0) return self.data.len;
++        var total: usize = if (self.source) |source| source.retained_bytes else 0;
++        for (self.frames.items) |frame| total += frame.data.len;
++        return total;
++    }
++
++    /// Once animated, each frame owns a complete RGBA canvas and data borrows
++    /// the current frame. This keeps the public image API format unchanged.
++    pub fn ensureFrames(self: *Image, alloc: Allocator) !void {
++        if (self.frames.items.len != 0) return;
++        try self.frames.ensureTotalCapacity(alloc, 1);
++        const pixels = try alloc.alloc(u8, @as(usize, self.width) * self.height * 4);
++        const stride: usize = if (self.format == .rgb) 3 else 4;
++        for (0..@as(usize, self.width) * self.height) |i| {
++            @memcpy(pixels[i * 4 ..][0..3], self.data[i * stride ..][0..3]);
++            pixels[i * 4 + 3] = if (stride == 4) self.data[i * stride + 3] else 255;
++        }
++        alloc.free(self.data);
++        self.frames.appendAssumeCapacity(.{ .data = pixels, .usage = self.usage });
++        self.data = pixels;
++        self.format = .rgba;
++    }
++
++    pub fn selectFrame(self: *Image, index: usize) void {
++        self.current_frame = index;
++        self.data = self.frames.items[index].data;
++        self.usage = self.frames.items[index].usage;
++    }
++
+     pub const Error = error{
+         InvalidData,
+         DecompressionFailed,
+@@ -572,7 +664,11 @@ pub const Image = struct {
+     };
+ 
+     pub fn deinit(self: *Image, alloc: Allocator) void {
+-        if (self.data.len > 0) alloc.free(self.data);
++        if (self.source) |source| source.deinit(alloc);
++        if (self.frames.items.len != 0) {
++            for (self.frames.items) |frame| alloc.free(frame.data);
++        } else if (self.data.len > 0) alloc.free(self.data);
++        self.frames.deinit(alloc);
+     }
+ 
+     /// Mostly for logging
+@@ -628,9 +724,7 @@ test "image load with image too wide" {
+         .data = try alloc.dupe(u8, "AAAA"),
+     };
+     defer cmd.deinit(alloc);
+-    var loading = try LoadingImage.init(io, alloc, &cmd, .direct);
+-    defer loading.deinit(alloc);
+-    try testing.expectError(error.DimensionsTooLarge, loading.complete(alloc));
++    try testing.expectError(error.DimensionsTooLarge, LoadingImage.init(io, alloc, &cmd, .direct));
+ }
+ 
+ test "image load with image too tall" {
+@@ -648,9 +742,7 @@ test "image load with image too tall" {
+         .data = try alloc.dupe(u8, "AAAA"),
+     };
+     defer cmd.deinit(alloc);
+-    var loading = try LoadingImage.init(io, alloc, &cmd, .direct);
+-    defer loading.deinit(alloc);
+-    try testing.expectError(error.DimensionsTooLarge, loading.complete(alloc));
++    try testing.expectError(error.DimensionsTooLarge, LoadingImage.init(io, alloc, &cmd, .direct));
+ }
+ 
+ test "image load: rgb, zlib compressed, direct" {
+diff --git a/src/terminal/kitty/graphics_storage.zig b/src/terminal/kitty/graphics_storage.zig
+index 2a9ad7f56..861e8af10 100644
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -129,6 +129,7 @@ pub const ImageStorage = struct {
+     /// The total bytes of image data that have been loaded and the limit.
+     /// If the limit is reached, the oldest images will be evicted to make
+     /// space. Unused images take priority.
++    now_ms: u64 = 0,
+     total_bytes: usize = 0,
+     total_limit: usize = 320 * 1000 * 1000, // 320MB
+ 
+@@ -160,7 +161,7 @@ pub const ImageStorage = struct {
+     /// screen switches); those must set only the dirty flag directly.
+     /// Bumping the generation for geometry changes would break the
+     /// contract that an unchanged generation means unchanged contents.
+-    fn markMutated(self: *ImageStorage, io: std.Io) void {
++    pub fn markMutated(self: *ImageStorage, io: std.Io) void {
+         self.dirty = true;
+         self.generation = nextGeneration(io);
+     }
+@@ -188,7 +189,7 @@ pub const ImageStorage = struct {
+         if (limit < self.total_bytes) {
+             const req_bytes = self.total_bytes - limit;
+             log.info("evicting images to lower limit, evicting={}", .{req_bytes});
+-            if (!try self.evictImage(io, alloc, req_bytes)) {
++            if (!try self.evictImage(io, alloc, s, req_bytes)) {
+                 log.warn("failed to evict enough images for required bytes", .{});
+             }
+         }
+@@ -198,16 +199,17 @@ pub const ImageStorage = struct {
+ 
+     /// Add an already-loaded image to the storage. This will automatically
+     /// free any existing image with the same ID.
+-    pub fn addImage(self: *ImageStorage, io: std.Io, alloc: Allocator, img: Image) Allocator.Error!void {
++    pub fn addImage(self: *ImageStorage, io: std.Io, alloc: Allocator, screen: *terminal.Screen, img: Image) Allocator.Error!void {
+         // If the image itself is over the limit, then error immediately
+-        if (img.data.len > self.total_limit) return error.OutOfMemory;
++        if (img.byteSize() > self.total_limit) return error.OutOfMemory;
+ 
+         // If this would put us over the limit, then evict.
+-        const total_bytes = self.total_bytes + img.data.len;
++        const replaced_bytes = if (self.imageById(img.id)) |old| old.byteSize() else 0;
++        const total_bytes = self.total_bytes - replaced_bytes + img.byteSize();
+         if (total_bytes > self.total_limit) {
+             const req_bytes = total_bytes - self.total_limit;
+             log.info("evicting images to make space for {} bytes", .{req_bytes});
+-            if (!try self.evictImage(io, alloc, req_bytes)) {
++            if (!try self.evictImage(io, alloc, screen, req_bytes)) {
+                 log.warn("failed to evict enough images for required bytes", .{});
+                 return error.OutOfMemory;
+             }
+@@ -224,12 +226,12 @@ pub const ImageStorage = struct {
+ 
+         // Write our new image
+         if (gop.found_existing) {
+-            self.total_bytes -= gop.value_ptr.data.len;
++            self.total_bytes -= gop.value_ptr.byteSize();
+             gop.value_ptr.deinit(alloc);
+         }
+ 
+         gop.value_ptr.* = img;
+-        self.total_bytes += img.data.len;
++        self.total_bytes += img.byteSize();
+ 
+         // Stamp the stored image with a fresh generation. This gives
+         // every add/replace a unique stamp even when the same image ID
+@@ -237,6 +239,7 @@ pub const ImageStorage = struct {
+         // (e.g. renderer texture caches) can detect content changes.
+         self.markMutated(io);
+         gop.value_ptr.generation = self.generation;
++        gop.value_ptr.transmission_generation = self.generation;
+     }
+ 
+     /// Add a placement for a given image. The caller must verify in advance
+@@ -245,6 +248,7 @@ pub const ImageStorage = struct {
+         self: *ImageStorage,
+         io: std.Io,
+         alloc: Allocator,
++        screen: *terminal.Screen,
+         image_id: u32,
+         placement_id: u32,
+         p: Placement,
+@@ -276,6 +280,7 @@ pub const ImageStorage = struct {
+         };
+ 
+         const gop = try self.placements.getOrPut(alloc, key);
++        if (gop.found_existing) gop.value_ptr.deinit(screen);
+         gop.value_ptr.* = p;
+ 
+         self.markMutated(io);
+@@ -292,6 +297,37 @@ pub const ImageStorage = struct {
+         return self.images.get(image_id);
+     }
+ 
++    pub fn placementKey(self: *const ImageStorage, image_id: u32, placement_id: u32) ?PlacementKey {
++        var iter = self.placements.iterator();
++        var selected: ?PlacementKey = null;
++        while (iter.next()) |entry| {
++            if (entry.key_ptr.image_id != image_id) continue;
++            const key = entry.key_ptr.*;
++            if (placement_id != 0) {
++                if (key.placement_id.tag == .external and key.placement_id.id == placement_id) return key;
++            } else if (selected == null or key.placement_id.id > selected.?.placement_id.id) selected = key;
++        }
++        return selected;
++    }
++
++    /// Remove descendants of deleted placements, including their unreferenced images.
++    fn pruneRelatives(self: *ImageStorage, alloc: Allocator, screen: *Screen) void {
++        var again = true;
++        while (again) {
++            again = false;
++            var iter = self.placements.iterator();
++            while (iter.next()) |entry| {
++                const parent = entry.value_ptr.parent orelse continue;
++                if (self.placements.contains(parent)) continue;
++                const image_id = entry.key_ptr.image_id;
++                entry.value_ptr.deinit(screen);
++                self.placements.removeByPtr(entry.key_ptr);
++                self.deleteIfUnused(alloc, image_id);
++                again = true;
++            }
++        }
++    }
++
+     /// Get an image by its number. If the image doesn't exist, return null.
+     pub fn imageByNumber(self: *const ImageStorage, image_number: u32) ?Image {
+         var newest: ?Image = null;
+@@ -300,7 +336,7 @@ pub const ImageStorage = struct {
+         while (it.next()) |kv| {
+             if (kv.value_ptr.number == image_number) {
+                 if (newest == null or
+-                    kv.value_ptr.generation > newest.?.generation)
++                    kv.value_ptr.transmission_generation > newest.?.transmission_generation)
+                 {
+                     newest = kv.value_ptr.*;
+                 }
+@@ -324,10 +360,15 @@ pub const ImageStorage = struct {
+         // delete-all runs on every screen clear (e.g. `ESC [ 2 J`), and
+         // we don't want empty clears to dirty the image state or bump
+         // the generation.
++        if (self.loading) |loading| {
++            loading.destroy(alloc);
++            self.loading = null;
++        }
+         const placements_before = self.placements.count();
+         const images_before = self.images.count();
+         defer if (self.placements.count() != placements_before or
+             self.images.count() != images_before) self.markMutated(io);
++        defer self.pruneRelatives(alloc, t.screens.active);
+ 
+         switch (cmd) {
+             .all => |delete_images| {
+@@ -339,6 +380,11 @@ pub const ImageStorage = struct {
+                         .virtual => continue,
+                     }
+ 
++                    const image = self.imageById(entry.key_ptr.image_id) orelse continue;
++                    const position = entry.value_ptr.screenPosition(t, 0) orelse continue;
++                    const extent = entry.value_ptr.gridSize(image, t);
++                    const active_top = t.screens.active.pages.pointFromPin(.screen, t.screens.active.pages.getTopLeft(.active)).?.screen.y;
++                    if (position.x >= t.cols or position.x + extent.cols <= 0 or position.y >= @as(i64, @intCast(active_top)) + t.rows or position.y + extent.rows <= active_top) continue;
+                     // Deinit the placement and remove it
+                     const image_id = entry.key_ptr.image_id;
+                     entry.value_ptr.deinit(t.screens.active);
+@@ -507,7 +553,7 @@ pub const ImageStorage = struct {
+ 
+                 var it = self.placements.iterator();
+                 while (it.next()) |entry| {
+-                    if (entry.key_ptr.image_id >= v.first or entry.key_ptr.image_id <= v.last) {
++                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
+                         const image_id = entry.key_ptr.image_id;
+                         entry.value_ptr.deinit(t.screens.active);
+                         self.placements.removeByPtr(entry.key_ptr);
+@@ -516,9 +562,24 @@ pub const ImageStorage = struct {
+                 }
+             },
+ 
+-            // We don't support animation frames yet so they are successfully
+-            // deleted!
+-            .animation_frames => {},
++            // Delete one animation frame, retaining the last frame unless forced.
++            .animation_frames => |v| frames: {
++                const id = if (v.image_id != 0) v.image_id else (self.imageByNumber(v.image_number) orelse break :frames).id;
++                const img = self.images.getPtr(id) orelse break :frames;
++                if (img.frames.items.len <= 1) {
++                    if (v.delete) self.deleteById(alloc, t.screens.active, id, 0, true);
++                    break :frames;
++                }
++                const index: usize = @min(@as(usize, v.frame -| 1), img.frames.items.len - 1);
++                const removed = img.frames.orderedRemove(index);
++                self.total_bytes -= removed.data.len;
++                alloc.free(removed.data);
++                const next = if (index < img.current_frame) img.current_frame - 1 else @min(img.current_frame, img.frames.items.len - 1);
++                img.selectFrame(next);
++                img.next_frame_ms = null;
++                self.markMutated(io);
++                img.generation = self.generation;
++            },
+         }
+     }
+ 
+@@ -565,7 +626,7 @@ pub const ImageStorage = struct {
+ 
+         // If we get here, we can delete the image.
+         if (self.images.getEntry(image_id)) |entry| {
+-            self.total_bytes -= entry.value_ptr.data.len;
++            self.total_bytes -= entry.value_ptr.byteSize();
+             entry.value_ptr.deinit(alloc);
+             self.images.removeByPtr(entry.key_ptr);
+         }
+@@ -588,7 +649,7 @@ pub const ImageStorage = struct {
+         while (it.next()) |entry| {
+             const img = self.imageById(entry.key_ptr.image_id) orelse continue;
+             const rect = entry.value_ptr.rect(img, t) orelse continue;
+-            if (target_pin.isBetween(rect.top_left, rect.bottom_right)) {
++            if (target_pin.x >= rect.top_left.x and target_pin.x <= rect.bottom_right.x and target_pin.isBetween(rect.top_left, rect.bottom_right)) {
+                 if (filter) |f| if (!f(filter_ctx, entry.value_ptr.*)) continue;
+                 entry.value_ptr.deinit(t.screens.active);
+                 self.placements.removeByPtr(entry.key_ptr);
+@@ -603,7 +664,7 @@ pub const ImageStorage = struct {
+     ///
+     /// This will evict as many images as necessary to make space for
+     /// req bytes.
+-    fn evictImage(self: *ImageStorage, io: std.Io, alloc: Allocator, req: usize) !bool {
++    fn evictImage(self: *ImageStorage, io: std.Io, alloc: Allocator, screen: *terminal.Screen, req: usize) !bool {
+         assert(req <= self.total_limit);
+ 
+         // Ironically we allocate to evict. We should probably redesign the
+@@ -700,22 +761,24 @@ pub const ImageStorage = struct {
+             var p_it = self.placements.iterator();
+             while (p_it.next()) |entry| {
+                 if (entry.key_ptr.image_id == c.id) {
++                    entry.value_ptr.deinit(screen);
+                     self.placements.removeByPtr(entry.key_ptr);
+                     any_evicted = true;
+                 }
+             }
+ 
+             if (self.images.getEntry(c.id)) |entry| {
+-                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.data.len });
++                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.byteSize() });
+ 
+-                evicted += entry.value_ptr.data.len;
+-                self.total_bytes -= entry.value_ptr.data.len;
++                evicted += entry.value_ptr.byteSize();
++                self.total_bytes -= entry.value_ptr.byteSize();
+ 
+                 entry.value_ptr.deinit(alloc);
+                 self.images.removeByPtr(entry.key_ptr);
+                 any_evicted = true;
+ 
+-                if (evicted > req) return true;
++                self.pruneRelatives(alloc, screen);
++                if (evicted >= req) return true;
+             }
+         }
+ 
+@@ -734,6 +797,12 @@ pub const ImageStorage = struct {
+     };
+ 
+     pub const Placement = struct {
++        parent: ?PlacementKey = null,
++        horizontal_offset: i32 = 0,
++        vertical_offset: i32 = 0,
++        /// Pixel dimensions supplied by the iTerm2 protocol.
++        pixel_width: u32 = 0,
++        pixel_height: u32 = 0,
+         /// The location where this placement should be drawn.
+         location: Location,
+ 
+@@ -772,6 +841,43 @@ pub const ImageStorage = struct {
+             }
+         }
+ 
++        /// Resolve placement origins in screen coordinates, including scrollback.
++        pub const ScreenPosition = struct { x: i64, y: i64 };
++        pub fn screenPosition(self: *const Placement, t: *const terminal.Terminal, depth: u8) ?ScreenPosition {
++            if (depth > 32) return null;
++            const storage = &t.screens.active.kitty_images;
++            if (self.parent) |parent| {
++                const p = storage.placements.getPtr(parent) orelse return null;
++                const origin: ScreenPosition = switch (p.location) {
++                    .pin => p.screenPosition(t, depth + 1) orelse return null,
++                    .virtual => virtual: {
++                        const pages = &t.screens.active.pages;
++                        const top = pages.getTopLeft(.screen);
++                        const bot = pages.getBottomRight(.screen) orelse return null;
++                        var iter = @import("graphics_unicode.zig").placementIterator(top, bot);
++                        var x: i64 = std.math.maxInt(i64);
++                        var y: i64 = std.math.maxInt(i64);
++                        while (iter.next()) |fragment| {
++                            if (fragment.image_id != parent.image_id) continue;
++                            if (fragment.placement_id != 0 and fragment.placement_id != parent.placement_id.id) continue;
++                            const point_ = pages.pointFromPin(.screen, fragment.pin) orelse continue;
++                            x = @min(x, @as(i64, @intCast(point_.screen.x)));
++                            y = @min(y, @as(i64, @intCast(point_.screen.y)));
++                        }
++                        if (x == std.math.maxInt(i64)) return null;
++                        break :virtual .{ .x = x, .y = y };
++                    },
++                };
++                return .{ .x = origin.x + self.horizontal_offset, .y = origin.y + self.vertical_offset };
++            }
++            const pin = switch (self.location) {
++                .pin => |pin| pin,
++                .virtual => return null,
++            };
++            const position = t.screens.active.pages.pointFromPin(.screen, pin.*) orelse return null;
++            return .{ .x = @intCast(position.screen.x), .y = @intCast(position.screen.y) };
++        }
++
+         /// Returns the size of this placement's image in pixels,
+         /// taking into account the source rectangle, specified
+         /// rows/columns, and aspect ratio.
+@@ -783,6 +889,8 @@ pub const ImageStorage = struct {
+             width: u32,
+             height: u32,
+         } {
++            if (self.pixel_width > 0 and self.pixel_height > 0)
++                return .{ .width = self.pixel_width, .height = self.pixel_height };
+             // Height / width of the image in px.
+             const width = if (self.source_width > 0) self.source_width else image.width;
+             const height = if (self.source_height > 0) self.source_height else image.height;
+@@ -810,8 +918,8 @@ pub const ImageStorage = struct {
+             // the width and height from them directly, we don't need
+             // to adjust for aspect ratio.
+             if (self.columns > 0 and self.rows > 0) {
+-                const calc_width = cell_width * self.columns;
+-                const calc_height = cell_height * self.rows;
++                const calc_width = (cell_width *| self.columns) -| self.x_offset;
++                const calc_height = (cell_height *| self.rows) -| self.y_offset;
+ 
+                 return .{
+                     .width = calc_width,
+@@ -826,10 +934,8 @@ pub const ImageStorage = struct {
+             // the height of the image based on the aspect ratio.
+             if (self.columns > 0) {
+                 const aspect = height_f64 / width_f64;
+-                const calc_width: u32 = cell_width * self.columns;
+-                const calc_height: u32 = @intFromFloat(@round(
+-                    @as(f64, @floatFromInt(calc_width)) * aspect,
+-                ));
++                const calc_width: u32 = (cell_width *| self.columns) -| self.x_offset;
++                const calc_height: u32 = @intFromFloat(@min(4294967295.0, @round(@as(f64, @floatFromInt(calc_width)) * aspect)));
+ 
+                 return .{
+                     .width = calc_width,
+@@ -841,10 +947,8 @@ pub const ImageStorage = struct {
+             // determine the width based on the aspect ratio.
+             {
+                 const aspect = width_f64 / height_f64;
+-                const calc_height: u32 = cell_height * self.rows;
+-                const calc_width: u32 = @intFromFloat(@round(
+-                    @as(f64, @floatFromInt(calc_height)) * aspect,
+-                ));
++                const calc_height: u32 = (cell_height *| self.rows) -| self.y_offset;
++                const calc_width: u32 = @intFromFloat(@min(4294967295.0, @round(@as(f64, @floatFromInt(calc_height)) * aspect)));
+ 
+                 return .{
+                     .width = calc_width,
+@@ -874,12 +978,12 @@ pub const ImageStorage = struct {
+             return .{
+                 .cols = std.math.divCeil(
+                     u32,
+-                    calc_size.width + self.x_offset,
++                    calc_size.width +| self.x_offset,
+                     t.width_px / t.cols,
+                 ) catch 0,
+                 .rows = std.math.divCeil(
+                     u32,
+-                    calc_size.height + self.y_offset,
++                    calc_size.height +| self.y_offset,
+                     t.height_px / t.rows,
+                 ) catch 0,
+             };
+@@ -896,25 +1000,29 @@ pub const ImageStorage = struct {
+             t: *const terminal.Terminal,
+         ) ?Rect {
+             const grid_size = self.gridSize(image, t);
+-            const pin = switch (self.location) {
+-                .pin => |p| p,
+-                .virtual => return null,
+-            };
+-
+-            var br = switch (pin.downOverflow(grid_size.rows - 1)) {
++            if (grid_size.cols == 0 or grid_size.rows == 0) return null;
++            if (self.location == .virtual) return null;
++            const position = self.screenPosition(t, 0) orelse return null;
++            if (position.x >= t.cols or position.x + grid_size.cols <= 0 or position.y + grid_size.rows <= 0) return null;
++            const top_x: u16 = @intCast(@max(0, position.x));
++            const top_y: u32 = std.math.cast(u32, @max(0, position.y)) orelse return null;
++            const pin = t.screens.active.pages.pin(.{ .screen = .{ .x = top_x, .y = top_y } }) orelse return null;
++            const last_y = @max(0, position.y + grid_size.rows - 1);
++            const rows: u32 = @intCast(last_y - top_y);
++            var br = switch (pin.downOverflow(rows)) {
+                 .offset => |v| v,
+                 .overflow => |v| v.end,
+             };
+-            br.x = @min(
++            br.x = @intCast(@min(
+                 // We need to sub one here because the x value is
+                 // one width already. So if the image is width "1"
+                 // then we add zero to X because X itself is width 1.
+-                pin.x + (grid_size.cols - 1),
++                @as(u32, @intCast(@max(0, position.x + grid_size.cols - 1))),
+                 t.cols - 1,
+-            );
++            ));
+ 
+             return .{
+-                .top_left = pin.*,
++                .top_left = pin,
+                 .bottom_right = br,
+             };
+         }
+@@ -942,10 +1050,10 @@ test "storage: add placement with zero placement id" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+-    try s.addPlacement(io, alloc, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     try testing.expectEqual(@as(usize, 2), s.placements.count());
+     try testing.expectEqual(@as(usize, 2), s.images.count());
+@@ -971,11 +1079,11 @@ test "storage: delete all placements and images" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .all = true });
+@@ -996,11 +1104,11 @@ test "storage: delete all placements and images preserves limit" {
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+     s.total_limit = 5000;
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .all = true });
+@@ -1021,11 +1129,11 @@ test "storage: delete all placements" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .all = false });
+@@ -1045,11 +1153,11 @@ test "storage: delete all placements by image id" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .id = .{ .image_id = 2 } });
+@@ -1069,11 +1177,11 @@ test "storage: delete all placements by image id and unused images" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .id = .{ .delete = true, .image_id = 2 } });
+@@ -1093,12 +1201,12 @@ test "storage: delete placement by specific id" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .id = .{
+@@ -1124,10 +1232,10 @@ test "storage: delete intersecting cursor" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     t.screens.active.cursorAbsolute(12, 12);
+ 
+@@ -1157,10 +1265,10 @@ test "storage: delete intersecting cursor plus unused" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     t.screens.active.cursorAbsolute(12, 12);
+ 
+@@ -1190,10 +1298,10 @@ test "storage: delete intersecting cursor hits multiple" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     t.screens.active.cursorAbsolute(26, 26);
+ 
+@@ -1217,10 +1325,10 @@ test "storage: delete by column" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .column = .{
+@@ -1250,10 +1358,10 @@ test "storage: delete by column 1x1" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 1, .height = 1 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 2, .y = 0 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 2, .y = 0 }) } });
+ 
+     s.delete(io, alloc, &t, .{ .column = .{
+         .delete = false,
+@@ -1285,10 +1393,10 @@ test "storage: delete by row" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 50, .height = 50 });
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 25, .height = 25 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .row = .{
+@@ -1318,10 +1426,10 @@ test "storage: delete by row 1x1" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 1, .height = 1 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) } });
+-    try s.addPlacement(io, alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 2 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 2 }) } });
+ 
+     s.delete(io, alloc, &t, .{ .row = .{
+         .delete = false,
+@@ -1351,11 +1459,11 @@ test "storage: delete images by range 1" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+     try testing.expectEqual(@as(usize, 2), s.placements.count());
+ 
+@@ -1377,11 +1485,11 @@ test "storage: delete images by range 2" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+     try testing.expectEqual(@as(usize, 2), s.placements.count());
+ 
+@@ -1403,11 +1511,11 @@ test "storage: delete images by range 3" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+     try testing.expectEqual(@as(usize, 2), s.placements.count());
+ 
+@@ -1415,8 +1523,8 @@ test "storage: delete images by range 3" {
+     s.delete(io, alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 1 } });
+     try testing.expect(s.dirty);
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+-    try testing.expectEqual(@as(usize, 0), s.placements.count());
+-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
++    try testing.expectEqual(@as(usize, 1), s.placements.count());
++    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+ }
+ 
+ test "storage: delete images by range 4" {
+@@ -1429,20 +1537,20 @@ test "storage: delete images by range 4" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addImage(io, alloc, .{ .id = 2 });
+-    try s.addImage(io, alloc, .{ .id = 3 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+-    try s.addPlacement(io, alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+     try testing.expectEqual(@as(usize, 2), s.placements.count());
+ 
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 1 } });
+     try testing.expect(s.dirty);
+-    try testing.expectEqual(@as(usize, 1), s.images.count());
+-    try testing.expectEqual(@as(usize, 0), s.placements.count());
+-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
++    try testing.expectEqual(@as(usize, 2), s.images.count());
++    try testing.expectEqual(@as(usize, 1), s.placements.count());
++    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+ }
+ 
+ test "storage: aspect ratio calculation when only columns or rows specified" {
+@@ -1505,7 +1613,7 @@ test "storage: generation stamps on image add and replace" {
+     // Fresh storage has generation zero (never mutated).
+     try testing.expectEqual(@as(u64, 0), s.generation);
+ 
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 1, .height = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+     const gen1 = s.generation;
+     try testing.expect(gen1 > 0);
+ 
+@@ -1513,7 +1621,7 @@ test "storage: generation stamps on image add and replace" {
+     try testing.expectEqual(gen1, img1.generation);
+ 
+     // A second image gets a strictly greater stamp.
+-    try s.addImage(io, alloc, .{ .id = 2, .width = 1, .height = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
+     const gen2 = s.generation;
+     try testing.expect(gen2 > gen1);
+     try testing.expectEqual(gen2, s.imageById(2).?.generation);
+@@ -1521,7 +1629,7 @@ test "storage: generation stamps on image add and replace" {
+     // Retransmitting the same image ID (identical dimensions) gets a
+     // fresh stamp: this is what makes same-sized retransmissions
+     // detectable by renderers.
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 1, .height = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+     const gen3 = s.generation;
+     try testing.expect(gen3 > gen2);
+     try testing.expectEqual(gen3, s.imageById(1).?.generation);
+@@ -1539,10 +1647,10 @@ test "storage: generation bumps on placement and delete" {
+ 
+     var s: ImageStorage = .{};
+     defer s.deinit(alloc, t.screens.active);
+-    try s.addImage(io, alloc, .{ .id = 1 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+     const gen_add = s.generation;
+ 
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     const gen_place = s.generation;
+     try testing.expect(gen_place > gen_add);
+ 
+@@ -1566,7 +1674,7 @@ test "storage: generation bumps when setLimit evicts or disables" {
+     defer s.deinit(alloc, t.screens.active);
+ 
+     const data = try alloc.dupe(u8, "1234");
+-    try s.addImage(io, alloc, .{ .id = 1, .width = 1, .height = 1, .data = data });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1, .data = data });
+     const gen_add = s.generation;
+ 
+     // Lowering the limit evicts the image and must mark a mutation.
+@@ -1596,12 +1704,12 @@ test "storage: imageByNumber returns most recently transmitted" {
+ 
+     // Two images sharing a number: the newest transmission wins,
+     // regardless of insertion order or clock resolution.
+-    try s.addImage(io, alloc, .{ .id = 1, .number = 7 });
+-    try s.addImage(io, alloc, .{ .id = 2, .number = 7 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .number = 7 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .number = 7 });
+     try testing.expectEqual(@as(u32, 2), s.imageByNumber(7).?.id);
+ 
+     // Retransmit the first: it becomes the newest.
+-    try s.addImage(io, alloc, .{ .id = 1, .number = 7 });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .number = 7 });
+     try testing.expectEqual(@as(u32, 1), s.imageByNumber(7).?.id);
+ }
+ 
+@@ -1630,8 +1738,8 @@ test "storage: no-op delete does not mark a mutation" {
+     try testing.expectEqual(@as(u64, 0), s.generation);
+ 
+     // Same for a delete that matches nothing.
+-    try s.addImage(io, alloc, .{ .id = 1 });
+-    try s.addPlacement(io, alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
++    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
++    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+     const gen = s.generation;
+     s.dirty = false;
+     s.delete(io, alloc, &t, .{ .id = .{ .image_id = 42 } });
+@@ -1654,17 +1762,17 @@ test "storage: evict unused transient image" {
+     var s: ImageStorage = .{ .total_limit = 192 };
+     defer s.deinit(alloc, t.screens.active);
+ 
+-    try s.addImage(io, alloc, .{
++    try s.addImage(io, alloc, t.screens.active, .{
+         .id = 1,
+         .data = try alloc.dupe(u8, "*" ** 64),
+         .usage = .{ .transient = false },
+     });
+-    try s.addImage(io, alloc, .{
++    try s.addImage(io, alloc, t.screens.active, .{
+         .id = 2,
+         .data = try alloc.dupe(u8, "*" ** 64),
+         .usage = .{ .transient = true },
+     });
+-    try s.addImage(io, alloc, .{
++    try s.addImage(io, alloc, t.screens.active, .{
+         .id = 3,
+         .data = try alloc.dupe(u8, "*" ** 64),
+         .usage = .{ .transient = true },
+@@ -1672,13 +1780,14 @@ test "storage: evict unused transient image" {
+     try s.addPlacement(
+         io,
+         alloc,
++        t.screens.active,
+         2,
+         1,
+         .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } },
+     );
+ 
+     const gen = s.generation;
+-    const result = try s.evictImage(io, alloc, 32);
++    const result = try s.evictImage(io, alloc, t.screens.active, 32);
+     try testing.expect(s.dirty);
+     try testing.expect(s.generation > gen);
+     try testing.expectEqual(true, result);
+diff --git a/src/terminal/kitty/graphics_unicode.zig b/src/terminal/kitty/graphics_unicode.zig
+index dd1a6ce44..485502593 100644
+--- a/src/terminal/kitty/graphics_unicode.zig
++++ b/src/terminal/kitty/graphics_unicode.zig
+@@ -1195,8 +1195,8 @@ test "unicode render placement: dog 4x2" {
+     defer s.deinit(alloc, t.screens.active);
+ 
+     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
+-    try s.addImage(io, alloc, image);
+-    try s.addPlacement(io, alloc, 1, 0, .{
++    try s.addImage(io, alloc, t.screens.active, image);
++    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
+         .location = .{ .virtual = {} },
+         .columns = 4,
+         .rows = 2,
+@@ -1263,8 +1263,8 @@ test "unicode render placement: dog 2x2 with blank cells" {
+     defer s.deinit(alloc, t.screens.active);
+ 
+     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
+-    try s.addImage(io, alloc, image);
+-    try s.addPlacement(io, alloc, 1, 0, .{
++    try s.addImage(io, alloc, t.screens.active, image);
++    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
+         .location = .{ .virtual = {} },
+         .columns = 2,
+         .rows = 2,
+@@ -1330,8 +1330,8 @@ test "unicode render placement: dog 1x1" {
+     defer s.deinit(alloc, t.screens.active);
+ 
+     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
+-    try s.addImage(io, alloc, image);
+-    try s.addPlacement(io, alloc, 1, 0, .{
++    try s.addImage(io, alloc, t.screens.active, image);
++    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
+         .location = .{ .virtual = {} },
+         .columns = 1,
+         .rows = 1,
+diff --git a/src/terminal/osc.zig b/src/terminal/osc.zig
+index 26ce12672..72bd798c2 100644
+--- a/src/terminal/osc.zig
++++ b/src/terminal/osc.zig
+@@ -162,6 +162,7 @@ pub const Command = union(Key) {
+     /// OSC 3008. Hierarchical context signalling (UAPI spec).
+     /// https://uapi-group.org/specifications/specs/osc_context/
+     context_signal: parsers.context_signal.Command,
++    iterm_image: @import("iterm_image.zig").Command,
+ 
+     pub const SemanticPrompt = parsers.semantic_prompt.Command;
+ 
+@@ -199,6 +200,7 @@ pub const Command = union(Key) {
+             "kitty_clipboard_protocol",
+             "kitty_dnd_protocol",
+             "context_signal",
++            "iterm_image",
+         },
+     );
+ 
+@@ -432,6 +434,7 @@ pub const Parser = struct {
+             .kitty_clipboard_protocol,
+             .kitty_dnd_protocol,
+             .context_signal,
++            .iterm_image,
+             => {},
+         }
+ 
+@@ -542,6 +545,26 @@ pub const Parser = struct {
+         }
+     }
+ 
++    /// Consume bytes already classified as OSC data by the VT parser.
++    pub fn nextSlice(self: *Parser, input: []const u8) void {
++        var offset: usize = 0;
++        while (offset < input.len) : (offset += 1) {
++            if (self.state == .invalid) return;
++            if (self.capture) |*cap| {
++                const remaining = input[offset..];
++                if (self.state == .@"1337" and remaining.len > (96 * 1024 * 1024) -| cap.writer.buffered().len) {
++                    self.state = .invalid;
++                    return;
++                }
++                cap.writer.writeAll(remaining) catch {
++                    self.state = .invalid;
++                };
++                return;
++            }
++            self.next(input[offset]);
++        }
++    }
++
+     /// Consume the next character c and advance the parser state.
+     pub fn next(self: *Parser, c: u8) void {
+         // If the state becomes invalid for any reason, just discard
+@@ -551,6 +574,10 @@ pub const Parser = struct {
+         // If a writer has been initialized, we just accumulate the rest of the
+         // OSC sequence in the writer's buffer and skip the state machine.
+         if (self.capture) |*cap| {
++            if (self.state == .@"1337" and cap.writer.buffered().len >= 96 * 1024 * 1024) {
++                self.state = .invalid;
++                return;
++            }
+             cap.writer.writeByte(c) catch |err| switch (err) {
+                 // We have overflowed our buffer or had some other error, set the
+                 // state to invalid so that we discard any further input.
+@@ -730,7 +757,7 @@ pub const Parser = struct {
+ 
+             .@"1337",
+             => switch (c) {
+-                ';' => self.captureTrailing(.fixed),
++                ';' => self.captureTrailing(.allocating),
+                 else => self.state = .invalid,
+             },
+ 
+diff --git a/src/terminal/osc/parsers/iterm2.zig b/src/terminal/osc/parsers/iterm2.zig
+index b05dd1b2a..2e2176396 100644
+--- a/src/terminal/osc/parsers/iterm2.zig
++++ b/src/terminal/osc/parsers/iterm2.zig
+@@ -13,6 +13,7 @@ const Key = enum {
+     AddHiddenAnnotation,
+     Block,
+     Button,
++    Capabilities,
+     ClearCapturedOutput,
+     ClearScrollback,
+     Copy,
+@@ -90,6 +91,20 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
+     };
+ 
+     switch (key) {
++        .File, .MultipartFile, .FilePart, .FileEnd, .Capabilities => {
++            const value = value_ orelse "";
++            parser.command = .{ .iterm_image = .{
++                .kind = switch (key) {
++                    .File => 0,
++                    .MultipartFile => 1,
++                    .FilePart => 2,
++                    .FileEnd => 3,
++                    .Capabilities => 4,
++                    else => unreachable,
++                },
++                .data = .{ .ptr = value.ptr, .len = value.len },
++            } };
++        },
+         .Copy => {
+             var value = value_ orelse {
+                 parser.command = .invalid;
+@@ -165,11 +180,7 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
+         .Custom,
+         .Disinter,
+         .EndCopy,
+-        .File,
+-        .FileEnd,
+-        .FilePart,
+         .HighlightCursorLine,
+-        .MultipartFile,
+         .OpenURL,
+         .PopKeyLabels,
+         .PushKeyLabels,
+diff --git a/src/terminal/stream.zig b/src/terminal/stream.zig
+index 791d0c55d..9492dcddc 100644
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -127,6 +127,7 @@ pub const Action = union(Key) {
+     kitty_color_report: kitty.color.OSC,
+     color_operation: ColorOperation,
+     semantic_prompt: SemanticPrompt,
++    iterm_image: @import("iterm_image.zig").Command,
+ 
+     pub const Key = lib.Enum(
+         lib.target,
+@@ -226,6 +227,7 @@ pub const Action = union(Key) {
+             "kitty_color_report",
+             "color_operation",
+             "semantic_prompt",
++            "iterm_image",
+         },
+     );
+ 
+@@ -679,6 +681,25 @@ pub fn Stream(comptime H: type) type {
+                         if (self.parser.state != .csi_param) continue;
+                     }
+ 
++                    // OSC image payloads need the same bulk path as APC.
++                    // Leave controls and C1 bytes to the transition table.
++                    if (self.parser.state == .osc_string) {
++                        const rest = input[offset..];
++                        var end: usize = 0;
++                        if (comptime std.simd.suggestVectorLength(u8)) |n| {
++                            const V = @Vector(n, u8);
++                            while (end + n <= rest.len) {
++                                const bytes: V = rest[end..][0..n].*;
++                                if (@reduce(.Or, (bytes < @as(V, @splat(0x20))) | (bytes >= @as(V, @splat(0x80))))) break;
++                                end += n;
++                            }
++                        }
++                        while (end < rest.len and rest[end] >= 0x20 and rest[end] < 0x80) : (end += 1) {}
++                        self.parser.osc_parser.nextSlice(rest[0..end]);
++                        offset += end;
++                        if (offset >= input.len) return input.len;
++                    }
++
+                     // Bulk-consume APC string bytes into a single slice.
+                     // APC payloads (e.g. Kitty graphics) can be megabytes
+                     // of base64 data, so per-byte dispatch is far too slow.
+@@ -2361,6 +2382,7 @@ pub fn Stream(comptime H: type) type {
+                 .kitty_color_protocol => |v| {
+                     self.handler.vt(.kitty_color_report, v);
+                 },
++                .iterm_image => |v| self.handler.vt(.iterm_image, v),
+ 
+                 .show_desktop_notification => |v| {
+                     self.handler.vt(.show_desktop_notification, .{
+@@ -3887,6 +3909,50 @@ const ApcTestHandler = struct {
+     }
+ };
+ 
++test "stream: osc bulk preserves scalar controls and fragmentation" {
++    const H = struct {
++        hash: std.hash.Wyhash = .init(0),
++        commands: usize = 0,
++        pub fn deinit(_: *@This()) void {}
++        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
++            switch (action) {
++                .window_title => {
++                    self.hash.update(value.title);
++                    self.commands += 1;
++                },
++                .iterm_image => {
++                    self.hash.update(value.data.ptr[0..value.data.len]);
++                    self.commands += 1;
++                },
++                else => {},
++            }
++        }
++    };
++    for (0..256) |control| {
++        var input: std.ArrayList(u8) = .empty;
++        defer input.deinit(testing.allocator);
++        try input.appendSlice(testing.allocator, "\x1b]1337;File=inline=1:" ++ "AAAA" ** 64);
++        try input.append(testing.allocator, @intCast(control));
++        try input.appendSlice(testing.allocator, "BBBB" ** 64 ++ "\x1b\\\x1b]2;title after image\x07");
++        var scalar: Stream(H) = .initAlloc(testing.allocator, .{});
++        defer scalar.deinit();
++        for (input.items) |byte| scalar.next(byte);
++        for ([_]usize{ 7, input.items.len }) |chunk_len| {
++            var bulk: Stream(H) = .initAlloc(testing.allocator, .{});
++            defer bulk.deinit();
++            var offset: usize = 0;
++            while (offset < input.items.len) {
++                const end = @min(input.items.len, offset + chunk_len);
++                bulk.nextSlice(input.items[offset..end]);
++                offset = end;
++            }
++            try testing.expectEqual(scalar.handler.commands, bulk.handler.commands);
++            try testing.expectEqual(scalar.handler.hash.final(), bulk.handler.hash.final());
++            try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        }
++    }
++}
++
+ test "stream: apc bulk slice" {
+     var s: Stream(ApcTestHandler) = .init(.{});
+     s.nextSlice("\x1b_Gf=24,s=10,v=20;aGVsbG8=\x1b\\");
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index bbbe5f83e..46f161756 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -59,8 +59,11 @@ pub const Handler = struct {
+     /// to send commands to the terminal emulator. This is used by
+     /// the kitty graphics protocol.
+     apc_handler: apc.Handler = .{},
++    iterm_images: @import("iterm_image.zig").Transfer = .{},
+ 
+     pub const Effects = struct {
++        /// Decoded file transfer. Name and bytes are borrowed for this call.
++        file_download: ?*const fn (*Handler, []const u8, []const u8) void = null,
+         /// Called when the terminal needs to write data back to the pty,
+         /// e.g. in response to a DECRQM query. The data is only valid
+         /// during the lifetime of the call so callers must copy it
+@@ -144,6 +147,7 @@ pub const Handler = struct {
+     }
+ 
+     pub fn deinit(self: *Handler) void {
++        self.iterm_images.deinit(self.terminal.gpa());
+         self.apc_handler.deinit();
+     }
+ 
+@@ -196,6 +200,10 @@ pub const Handler = struct {
+         value: Action.Value(action),
+     ) !void {
+         switch (action) {
++            .iterm_image => self.iterm_images.process(self.terminal, value, self) catch |err| {
++                self.iterm_images.deinit(self.terminal.gpa());
++                log.warn("invalid iTerm2 image: {}", .{err});
++            },
+             .print => try self.terminal.print(value.cp),
+             .print_slice => try self.terminal.printSlice(value.cps),
+             .print_repeat => try self.terminal.printRepeat(value),
+@@ -288,7 +296,10 @@ pub const Handler = struct {
+             },
+             .active_status_display => self.terminal.status_display = value,
+             .decaln => try self.terminal.decaln(),
+-            .full_reset => self.terminal.fullReset(),
++            .full_reset => {
++                self.iterm_images.deinit(self.terminal.gpa());
++                self.terminal.fullReset();
++            },
+             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
+             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
+             .semantic_prompt => try self.terminal.semanticPrompt(value),
+diff --git a/src/terminal/sys.zig b/src/terminal/sys.zig
+index f0c64da50..30ccfafb6 100644
+--- a/src/terminal/sys.zig
++++ b/src/terminal/sys.zig
+@@ -22,6 +22,40 @@ pub var decode_png: ?DecodePngFn = png: {
+ 
+ pub const DecodeError = Allocator.Error || error{InvalidData};
+ pub const DecodePngFn = *const fn (Allocator, []const u8) DecodeError!Image;
++/// General raster decoder used by the iTerm2 inline-image protocol.
++pub var decode_image: ?*const fn (Allocator, []const u8) DecodeError!Animation = null;
++
++pub const Animation = struct {
++    width: u32,
++    height: u32,
++    frames: []Frame,
++    loops: u32 = 0,
++    source: ?Source = null,
++
++    /// A bounded decoder that produces later frames without blocking ticks.
++    pub const Source = struct {
++        context: *anyopaque,
++        retained_bytes: usize,
++        next: *const fn (Allocator, *anyopaque) DecodeError!Poll,
++        destroy: *const fn (Allocator, *anyopaque) void,
++        pub const Poll = union(enum) { pending, done, frame: Frame };
++        pub fn deinit(self: Source, alloc: Allocator) void {
++            self.destroy(alloc, self.context);
++        }
++    };
++
++    pub const Frame = struct {
++        data: []u8,
++        gap_ms: u32 = 0,
++        usage: @import("kitty/graphics_command.zig").Transmission.Usage = .default,
++    };
++
++    pub fn deinit(self: Animation, alloc: Allocator) void {
++        if (self.source) |source| source.deinit(alloc);
++        for (self.frames) |frame| alloc.free(frame.data);
++        alloc.free(self.frames);
++    }
++};
+ 
+ /// The result of decoding an image. The caller owns the returned data
+ /// and must free it with the same allocator that was passed to the
+diff --git a/src/terminal/iterm_image.zig b/src/terminal/iterm_image.zig
+new file mode 100644
+--- /dev/null
++++ b/src/terminal/iterm_image.zig
+@@ -0,0 +1,305 @@
++//! iTerm2 OSC 1337 inline images. Parsing and cursor/scrollback ownership stay
++//! in the terminal; the embedder supplies the image decoder through sys.
++const std = @import("std");
++const lib = @import("lib.zig");
++const Terminal = @import("Terminal.zig");
++const sys = @import("sys.zig");
++const graphics = @import("kitty/graphics_storage.zig");
++const options = @import("terminal_options");
++const simd = @import("../simd/main.zig");
++const max_encoded = 96 * 1024 * 1024;
++const max_decoded = 64 * 1024 * 1024;
++
++pub const Command = extern struct { kind: u32, data: lib.String };
++
++fn decodedSize(input: []const u8) !usize {
++    return std.base64.standard.Decoder.calcSizeForSlice(input);
++}
++
++fn decodeBase64(input: []const u8, output: []u8) !void {
++    if (input.len == 0) return;
++    // SIMDUTF deliberately accepts whitespace and non-canonical trailing bits.
++    // Preserve the strict iTerm decoder: validate its final quartet with the
++    // standard decoder, then require the exact length (whitespace reduces it).
++    const tail = input[input.len - 4 ..];
++    var scratch: [3]u8 = undefined;
++    try std.base64.standard.Decoder.decode(scratch[0..try decodedSize(tail)], tail);
++    const decoded = try simd.base64.decode(input, output);
++    if (decoded.len != output.len) return error.InvalidData;
++}
++
++const Dimension = union(enum) {
++    auto,
++    cells: f64,
++    pixels: f64,
++    percent: f64,
++
++    fn parse(text: []const u8) !Dimension {
++        if (std.mem.eql(u8, text, "auto")) return .auto;
++        const px = std.mem.endsWith(u8, text, "px");
++        const percent = std.mem.endsWith(u8, text, "%");
++        const number = text[0 .. text.len - @as(usize, if (px) 2 else if (percent) 1 else 0)];
++        const value = try std.fmt.parseFloat(f64, number);
++        if (!std.math.isFinite(value) or value <= 0 or value > 1000000) return error.InvalidSize;
++        return if (px) .{ .pixels = value } else if (percent) .{ .percent = value } else .{ .cells = value };
++    }
++
++    fn resolve(self: Dimension, cell: u32, extent: u32) ?f64 {
++        return switch (self) {
++            .auto => null,
++            .pixels => |v| v,
++            .cells => |v| v * @as(f64, @floatFromInt(cell)),
++            .percent => |v| v * @as(f64, @floatFromInt(extent)) / 100,
++        };
++    }
++};
++
++test "iterm SIMD base64 preserves strict decoding" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var bytes: [257]u8 = undefined;
++    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 73 + 11);
++    var text: [std.base64.standard.Encoder.calcSize(bytes.len)]u8 = undefined;
++    for (0..bytes.len + 1) |len| {
++        const input = std.base64.standard.Encoder.encode(&text, bytes[0..len]);
++        const output = try alloc.alloc(u8, try decodedSize(input));
++        defer alloc.free(output);
++        try decodeBase64(input, output);
++        try testing.expectEqualSlices(u8, bytes[0..len], output);
++    }
++
++    // Compare to the old strict decoder for every byte at each position,
++    // including embedded padding, whitespace, high bytes and trailing bits.
++    for ([_][]const u8{ "aGVsbG8=", "aGVsbA==", "aGVsbG8h" }) |valid| {
++        var input: [8]u8 = undefined;
++        for (0..input.len) |position| {
++            for (0..256) |value| {
++                @memcpy(&input, valid);
++                input[position] = @intCast(value);
++                const len = decodedSize(&input) catch continue;
++                var expected: [6]u8 = undefined;
++                var actual: [6]u8 = undefined;
++                const accepted = if (std.base64.standard.Decoder.decode(expected[0..len], &input)) |_| true else |_| false;
++                const result = decodeBase64(&input, actual[0..len]);
++                if (accepted) {
++                    try result;
++                    try testing.expectEqualSlices(u8, expected[0..len], actual[0..len]);
++                } else {
++                    try testing.expect(if (result) |_| false else |_| true);
++                }
++            }
++        }
++    }
++}
++
++test "iterm multipart base64 preserves every split and final padding" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var bytes: [257]u8 = undefined;
++    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index * 73 + 11);
++    var text: [std.base64.standard.Encoder.calcSize(bytes.len)]u8 = undefined;
++    for (0..bytes.len + 1) |len| {
++        const input = std.base64.standard.Encoder.encode(&text, bytes[0..len]);
++        for (1..18) |chunk_size| {
++            var transfer: Transfer = .{};
++            defer transfer.deinit(alloc);
++            var offset: usize = 0;
++            while (offset < input.len) {
++                const end = @min(offset + chunk_size, input.len);
++                try transfer.append(alloc, input[offset..end]);
++                offset = end;
++            }
++            try transfer.appendDecoded(alloc, transfer.pending[0..transfer.pending_len], true);
++            try testing.expectEqualSlices(u8, bytes[0..len], transfer.data.items);
++            try testing.expectEqual(input.len, transfer.encoded_len);
++        }
++    }
++    var transfer: Transfer = .{};
++    defer transfer.deinit(alloc);
++    try transfer.append(alloc, "Zg==");
++    try testing.expectError(error.InvalidPadding, transfer.append(alloc, "YQ=="));
++}
++
++pub const Transfer = struct {
++    // Multipart data is decoded as it arrives. Keep only the last quartet so
++    // FileParts may split anywhere, including between padding characters.
++    data: std.ArrayList(u8) = .empty,
++    pending: [4]u8 = undefined,
++    pending_len: usize = 0,
++    encoded_len: usize = 0,
++    active: bool = false,
++    name: []const u8 = &.{},
++    inline_image: bool = false,
++    preserve_aspect: bool = true,
++    width: Dimension = .auto,
++    height: Dimension = .auto,
++
++    pub fn deinit(self: *Transfer, alloc: std.mem.Allocator) void {
++        self.data.deinit(alloc);
++        alloc.free(self.name);
++        self.* = .{};
++    }
++
++    fn metadata(self: *Transfer, alloc: std.mem.Allocator, text: []const u8) !void {
++        var fields = std.mem.splitScalar(u8, text, ';');
++        while (fields.next()) |field| {
++            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
++            const key = field[0..eq];
++            const value = field[eq + 1 ..];
++            if (std.mem.eql(u8, key, "name")) {
++                const decoder = std.base64.standard.Decoder;
++                const len = try decoder.calcSizeForSlice(value);
++                if (len > 4096) return error.InvalidName;
++                const name = try alloc.alloc(u8, len);
++                errdefer alloc.free(name);
++                try decoder.decode(name, value);
++                alloc.free(self.name);
++                self.name = name;
++            } else if (std.mem.eql(u8, key, "inline")) {
++                self.inline_image = std.mem.eql(u8, value, "1");
++            } else if (std.mem.eql(u8, key, "preserveAspectRatio")) {
++                self.preserve_aspect = !std.mem.eql(u8, value, "0");
++            } else if (std.mem.eql(u8, key, "width")) {
++                self.width = try .parse(value);
++            } else if (std.mem.eql(u8, key, "height")) {
++                self.height = try .parse(value);
++            }
++        }
++    }
++
++    fn append(self: *Transfer, alloc: std.mem.Allocator, data: []const u8) !void {
++        if (data.len > max_encoded -| self.encoded_len) return error.ImageTooLarge;
++        self.encoded_len += data.len;
++        if (data.len == 0) return;
++        var rest = data;
++        if (self.pending_len > 0) {
++            const take = @min(4 - self.pending_len, rest.len);
++            @memcpy(self.pending[self.pending_len..][0..take], rest[0..take]);
++            self.pending_len += take;
++            rest = rest[take..];
++            if (rest.len == 0) return;
++            // Padding is only valid in the very last quartet of the transfer.
++            try self.appendDecoded(alloc, &self.pending, false);
++            self.pending_len = 0;
++        }
++        const complete = (rest.len - 1) / 4 * 4;
++        try self.appendDecoded(alloc, rest[0..complete], false);
++        rest = rest[complete..];
++        @memcpy(self.pending[0..rest.len], rest);
++        self.pending_len = rest.len;
++    }
++
++    fn appendDecoded(self: *Transfer, alloc: std.mem.Allocator, input: []const u8, final: bool) !void {
++        const len = try decodedSize(input);
++        if (!final and len != input.len / 4 * 3) return error.InvalidPadding;
++        if (len > max_decoded -| self.data.items.len) return error.ImageTooLarge;
++        const start = self.data.items.len;
++        try self.data.resize(alloc, start + len);
++        errdefer self.data.items.len = start;
++        try decodeBase64(input, self.data.items[start..]);
++    }
++
++    pub fn process(self: *Transfer, t: *Terminal, cmd: Command, handler: anytype) !void {
++        if (comptime !options.kitty_graphics) return;
++        const alloc = t.gpa();
++        const text = cmd.data.ptr[0..cmd.data.len];
++        switch (cmd.kind) {
++            0 => {
++                self.deinit(alloc);
++                defer self.deinit(alloc);
++                const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidData;
++                try self.metadata(alloc, text[0..colon]);
++                const input = text[colon + 1 ..];
++                if (input.len > max_encoded) return error.ImageTooLarge;
++                const len = try decodedSize(input);
++                if (len > max_decoded) return error.ImageTooLarge;
++                const decoded = try alloc.alloc(u8, len);
++                defer alloc.free(decoded);
++                try decodeBase64(input, decoded);
++                try self.finish(t, handler, decoded);
++            },
++            1 => {
++                self.deinit(alloc);
++                try self.metadata(alloc, text);
++                self.active = true;
++            },
++            2 => {
++                if (!self.active) return error.NoTransfer;
++                if (text.len > 1048576) return error.ImageTooLarge;
++                try self.append(alloc, text);
++            },
++            3 => {
++                defer self.deinit(alloc);
++                if (!self.active) return error.NoTransfer;
++                try self.appendDecoded(alloc, self.pending[0..self.pending_len], true);
++                try self.finish(t, handler, self.data.items);
++            },
++            4 => {
++                if (sys.decode_image != null and t.screens.active.kitty_images.enabled()) {
++                    if (handler.effects.write_pty) |write| write(handler, "\x1b]1337;Capabilities=F\x1b\\");
++                }
++            },
++            else => return error.InvalidData,
++        }
++    }
++
++    fn finish(self: *Transfer, t: *Terminal, handler: anytype, encoded: []const u8) !void {
++        const alloc = t.gpa();
++        const storage = &t.screens.active.kitty_images;
++        if (!self.inline_image) {
++            const callback = handler.effects.file_download orelse return;
++            callback(handler, self.name, encoded);
++            return;
++        }
++        if (!storage.enabled()) return;
++        const decoder = sys.decode_image orelse return error.UnsupportedFormat;
++        const decoded = try decoder(alloc, encoded);
++        var pixels_owned = true;
++        defer if (pixels_owned) decoded.deinit(alloc);
++        if (decoded.width == 0 or decoded.height == 0 or decoded.frames.len == 0 or @as(usize, decoded.width) * decoded.height * 4 > storage.total_limit / decoded.frames.len) return error.InvalidSize;
++        const cell_w = @max(1, t.width_px / t.cols);
++        const cell_h = @max(1, t.height_px / t.rows);
++        const requested_w = self.width.resolve(cell_w, t.width_px);
++        const requested_h = self.height.resolve(cell_h, t.height_px);
++        const natural_w: f64 = @floatFromInt(decoded.width);
++        const natural_h: f64 = @floatFromInt(decoded.height);
++        var width = requested_w orelse natural_w;
++        var height = requested_h orelse natural_h;
++        if (self.preserve_aspect) {
++            const scale = if (requested_w != null and requested_h != null)
++                @min(width / natural_w, height / natural_h)
++            else if (requested_w != null) width / natural_w else if (requested_h != null) height / natural_h else @min(1, @as(f64, @floatFromInt(t.width_px)) / natural_w);
++            width = natural_w * scale;
++            height = natural_h * scale;
++        }
++        if (width < 1 or height < 1 or width > 1000000 or height > 1000000) return error.InvalidSize;
++        const pixel_width: u32 = @intFromFloat(@round(width));
++        const pixel_height: u32 = @intFromFloat(@round(height));
++        while (storage.next_image_id == 0 or storage.imageById(storage.next_image_id) != null) storage.next_image_id +%= 1;
++        const id = storage.next_image_id;
++        storage.next_image_id +%= 1;
++        const pin = try t.screens.active.pages.trackPin(t.screens.active.cursor.page_pin.*);
++        var pin_owned = true;
++        defer if (pin_owned) t.screens.active.pages.untrackPin(pin);
++        try storage.addImage(t.io(), alloc, t.screens.active, .{
++            .id = id,
++            .implicit_id = true,
++            .width = decoded.width,
++            .height = decoded.height,
++            .format = .rgba,
++            .data = decoded.frames[0].data,
++            .frames = .{ .items = decoded.frames, .capacity = decoded.frames.len },
++            .source = decoded.source,
++            .animation = if (decoded.frames.len > 1 or decoded.source != null) .run else .stop,
++            .loops = decoded.loops,
++            .next_frame_ms = storage.now_ms +| decoded.frames[0].gap_ms,
++        });
++        pixels_owned = false;
++        errdefer storage.delete(t.io(), alloc, t, .{ .id = .{ .image_id = id, .placement_id = 0, .delete = true } });
++        try storage.addPlacement(t.io(), alloc, t.screens.active, id, 0, .{ .location = .{ .pin = pin }, .pixel_width = pixel_width, .pixel_height = pixel_height });
++        pin_owned = false;
++        const rows = (pixel_height + cell_h - 1) / cell_h;
++        for (0..rows) |_| try t.index();
++        t.carriageReturn();
++    }
++};
+diff --git a/src/terminal/kitty/graphics_animation.zig b/src/terminal/kitty/graphics_animation.zig
+new file mode 100644
+--- /dev/null
++++ b/src/terminal/kitty/graphics_animation.zig
+@@ -0,0 +1,317 @@
++//! Kitty animation canvases and playback, owned by terminal image storage.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Terminal = @import("../Terminal.zig");
++const command = @import("graphics_command.zig");
++const image = @import("graphics_image.zig");
++const Storage = @import("graphics_storage.zig").ImageStorage;
++
++fn find(storage: *Storage, id: u32, number: u32) !*image.Image {
++    if ((id == 0 and number == 0) or (id != 0 and number != 0)) return error.InvalidData;
++    const resolved = if (id != 0) id else (storage.imageByNumber(number) orelse return error.ImageNotFound).id;
++    return storage.images.getPtr(resolved) orelse error.ImageNotFound;
++}
++
++fn prepare(alloc: Allocator, storage: *Storage, img: *image.Image) !void {
++    const previous = img.byteSize();
++    const rgba_size = @as(usize, img.width) * img.height * 4;
++    if (img.frames.items.len == 0 and rgba_size > storage.total_limit -| (storage.total_bytes - previous)) return error.StorageFull;
++    try img.ensureFrames(alloc);
++    storage.total_bytes = storage.total_bytes - previous + img.byteSize();
++}
++
++fn changed(io: std.Io, storage: *Storage, img: *image.Image) void {
++    storage.markMutated(io);
++    img.generation = storage.generation;
++}
++
++fn frameIndex(img: *const image.Image, number: u32) !usize {
++    if (number == 0 or number > img.frames.items.len) return error.ImageNotFound;
++    return number - 1;
++}
++
++fn checkRect(width: u32, height: u32, x: u32, y: u32, w: u32, h: u32) !void {
++    if (x > width or y > height or w == 0 or h == 0 or w > width - x or h > height - y) return error.InvalidData;
++}
++
++fn composePixels(dest: []u8, source: []const u8, dest_width: u32, source_width: u32, dx: u32, dy: u32, sx: u32, sy: u32, width: u32, height: u32, overwrite: bool, source_stride: usize) void {
++    for (0..height) |row| {
++        for (0..width) |col| {
++            const d = ((@as(usize, dy) + row) * dest_width + dx + col) * 4;
++            const s = ((@as(usize, sy) + row) * source_width + sx + col) * source_stride;
++            const alpha: u32 = if (source_stride == 4) source[s + 3] else 255;
++            if (overwrite or alpha == 255) {
++                @memcpy(dest[d..][0..3], source[s..][0..3]);
++                dest[d + 3] = @intCast(alpha);
++            } else if (alpha != 0) {
++                const old_alpha: u32 = dest[d + 3];
++                const combined = alpha * 255 + old_alpha * (255 - alpha);
++                for (0..3) |component| {
++                    const numerator = @as(u32, source[s + component]) * alpha * 255 + @as(u32, dest[d + component]) * old_alpha * (255 - alpha);
++                    dest[d + component] = @intCast((numerator + combined / 2) / combined);
++                }
++                dest[d + 3] = @intCast((combined + 127) / 255);
++            }
++        }
++    }
++}
++
++pub fn transmit(io: std.Io, alloc: Allocator, terminal: *Terminal, cmd: *const command.Command) !command.Response {
++    const storage = &terminal.screens.active.kitty_images;
++    const transmission = cmd.transmission().?;
++    var loading: image.LoadingImage = if (storage.loading) |pending| blk: {
++        if (pending.animation_frame == null) return error.InvalidData;
++        pending.addData(alloc, cmd.data) catch |err| {
++            pending.destroy(alloc);
++            storage.loading = null;
++            return err;
++        };
++        if (transmission.more_chunks) return .{};
++        defer alloc.destroy(pending);
++        storage.loading = null;
++        break :blk pending.*;
++    } else blk: {
++        _ = try find(storage, transmission.image_id, transmission.image_number);
++        break :blk try image.LoadingImage.init(io, alloc, cmd, storage.image_limits);
++    };
++    var loading_owned = true;
++    errdefer if (loading_owned) loading.deinit(alloc);
++    if (transmission.more_chunks) {
++        const pending = try alloc.create(image.LoadingImage);
++        pending.* = loading;
++        storage.loading = pending;
++        return .{};
++    }
++    const settings = loading.animation_frame.?;
++    var patch = try loading.complete(alloc);
++    defer patch.deinit(alloc);
++    loading.deinit(alloc);
++    loading_owned = false;
++    return applyFrame(io, alloc, storage, settings, &patch);
++}
++
++fn applyFrame(io: std.Io, alloc: Allocator, storage: *Storage, settings: command.AnimationFrameLoading, patch: *const image.Image) !command.Response {
++    const img = try find(storage, settings.transmission.image_id, settings.transmission.image_number);
++    try checkRect(img.width, img.height, settings.x, settings.y, patch.width, patch.height);
++    try prepare(alloc, storage, img);
++    const edit = if (settings.edit_frame != 0) try frameIndex(img, settings.edit_frame) else null;
++    const base = if (edit) |index| index else if (settings.create_frame != 0) try frameIndex(img, settings.create_frame) else null;
++    const frame_bytes = @as(usize, img.width) * img.height * 4;
++    if (edit == null and (frame_bytes > storage.total_limit -| storage.total_bytes or img.frames.items.len >= 4096)) return error.StorageFull;
++    var frame: image.Image.Frame = .{
++        .data = try alloc.alloc(u8, frame_bytes),
++        .gap_ms = if (settings.gap_ms == 0) (if (edit) |index| img.frames.items[index].gap_ms else 40) else @intCast(@max(0, settings.gap_ms)),
++        .usage = patch.usage,
++    };
++    errdefer alloc.free(frame.data);
++    if (base) |index| {
++        @memcpy(frame.data, img.frames.items[index].data);
++        frame.usage.transient = frame.usage.transient or img.frames.items[index].usage.transient;
++    } else {
++        const bg = settings.background;
++        for (0..frame_bytes / 4) |i| @memcpy(frame.data[i * 4 ..][0..4], &[_]u8{ bg.r, bg.g, bg.b, bg.a });
++    }
++    composePixels(frame.data, patch.data, img.width, patch.width, settings.x, settings.y, 0, 0, patch.width, patch.height, settings.composition_mode == .overwrite, if (patch.format == .rgb) 3 else 4);
++    if (edit) |index| {
++        alloc.free(img.frames.items[index].data);
++        img.frames.items[index] = frame;
++        if (index == img.current_frame) {
++            img.selectFrame(index);
++            changed(io, storage, img);
++        }
++    } else {
++        try img.frames.append(alloc, frame);
++        storage.total_bytes += frame_bytes;
++        storage.markMutated(io);
++    }
++    return .{ .id = img.id, .image_number = settings.transmission.image_number };
++}
++
++pub fn control(io: std.Io, alloc: Allocator, terminal: *Terminal, settings: command.AnimationControl) !command.Response {
++    const storage = &terminal.screens.active.kitty_images;
++    const img = try find(storage, settings.image_id, settings.image_number);
++    try prepare(alloc, storage, img);
++    const target = if (settings.current_frame != 0) try frameIndex(img, settings.current_frame) else null;
++    const gap_target = if (settings.frame != 0) try frameIndex(img, settings.frame) else img.current_frame;
++    if (settings.gap_ms != 0) {
++        img.frames.items[gap_target].gap_ms = @intCast(@max(0, settings.gap_ms));
++        if (gap_target == img.current_frame) img.next_frame_ms = null;
++    }
++    if (settings.loops != 0) img.loops = settings.loops - 1;
++    if (target) |index| {
++        img.selectFrame(index);
++        img.next_frame_ms = null;
++        changed(io, storage, img);
++    }
++    if (settings.action != .invalid) {
++        img.animation = settings.action;
++        img.next_frame_ms = null;
++        if (settings.action == .stop) img.completed_loops = 0;
++    }
++    _ = tickImage(io, alloc, storage, img, storage.now_ms);
++    return .{ .id = img.id, .image_number = settings.image_number };
++}
++
++pub fn compose(io: std.Io, alloc: Allocator, terminal: *Terminal, settings: command.AnimationFrameComposition) !command.Response {
++    const storage = &terminal.screens.active.kitty_images;
++    const img = try find(storage, settings.image_id, settings.image_number);
++    try prepare(alloc, storage, img);
++    const src = try frameIndex(img, settings.edit_frame);
++    const dst = try frameIndex(img, settings.frame);
++    const width = if (settings.width == 0) img.width else settings.width;
++    const height = if (settings.height == 0) img.height else settings.height;
++    try checkRect(img.width, img.height, settings.x, settings.y, width, height);
++    try checkRect(img.width, img.height, settings.left_edge, settings.top_edge, width, height);
++    if (src == dst and settings.x < settings.left_edge + width and settings.left_edge < settings.x + width and settings.y < settings.top_edge + height and settings.top_edge < settings.y + height) return error.InvalidData;
++    composePixels(img.frames.items[dst].data, img.frames.items[src].data, img.width, img.width, settings.left_edge, settings.top_edge, settings.x, settings.y, width, height, settings.composition_mode == .overwrite, 4);
++    img.frames.items[dst].usage.transient = img.frames.items[dst].usage.transient or img.frames.items[src].usage.transient;
++    if (dst == img.current_frame) {
++        img.selectFrame(dst);
++        changed(io, storage, img);
++    }
++    return .{ .id = img.id, .image_number = settings.image_number };
++}
++
++fn tickImage(io: std.Io, alloc: Allocator, storage: *Storage, img: *image.Image, now: u64) bool {
++    if (img.animation == .stop or img.frames.items.len == 0) return false;
++    if (img.next_frame_ms == null) img.next_frame_ms = now +| img.frames.items[img.current_frame].gap_ms;
++    var advanced = false;
++    // Bound catch-up work, including an animation containing only gapless frames.
++    var steps: usize = 0;
++    while (now >= img.next_frame_ms.?) : (steps += 1) {
++        if (steps >= img.frames.items.len * 2) {
++            img.next_frame_ms = now +| @max(1, img.frames.items[img.current_frame].gap_ms);
++            break;
++        }
++        var next = img.current_frame + 1;
++        if (next == img.frames.items.len) {
++            if (img.source) |source| {
++                const result = source.next(alloc, source.context) catch {
++                    storage.total_bytes -= source.retained_bytes;
++                    source.deinit(alloc);
++                    img.source = null;
++                    img.animation = .stop;
++                    img.next_frame_ms = null;
++                    break;
++                };
++                switch (result) {
++                    .pending => break,
++                    .done => {
++                        storage.total_bytes -= source.retained_bytes;
++                        source.deinit(alloc);
++                        img.source = null;
++                        if (img.frames.items.len == 1) {
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        }
++                    },
++                    .frame => |frame| {
++                        if (frame.data.len > storage.total_limit -| storage.total_bytes or img.frames.items.len >= 4096) {
++                            alloc.free(frame.data);
++                            storage.total_bytes -= source.retained_bytes;
++                            source.deinit(alloc);
++                            img.source = null;
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        }
++                        img.frames.append(alloc, frame) catch {
++                            alloc.free(frame.data);
++                            storage.total_bytes -= source.retained_bytes;
++                            source.deinit(alloc);
++                            img.source = null;
++                            img.animation = .stop;
++                            img.next_frame_ms = null;
++                            break;
++                        };
++                        storage.total_bytes += frame.data.len;
++                    },
++                }
++            }
++        }
++        if (next == img.frames.items.len) {
++            if (img.animation == .run_wait) break;
++            img.completed_loops +|= 1;
++            if (img.loops != 0 and img.completed_loops >= img.loops) {
++                img.animation = .stop;
++                img.next_frame_ms = null;
++                break;
++            }
++            next = 0;
++        }
++        img.selectFrame(next);
++        img.next_frame_ms = img.next_frame_ms.? +| img.frames.items[next].gap_ms;
++        advanced = true;
++    }
++    if (advanced) changed(io, storage, img);
++    return advanced;
++}
++
++pub fn tick(io: std.Io, alloc: Allocator, storage: *Storage, now: u64) bool {
++    storage.now_ms = @max(storage.now_ms, now);
++    var advanced = false;
++    var iter = storage.images.valueIterator();
++    while (iter.next()) |img| advanced = tickImage(io, alloc, storage, img, storage.now_ms) or advanced;
++    return advanced;
++}
++
++test "deferred animation accounts for frames and releases its source" {
++    const testing = std.testing;
++    const Source = @import("../sys.zig").Animation.Source;
++    const Context = struct {
++        polls: usize = 0,
++        frees: usize = 0,
++        fn next(alloc: Allocator, raw: *anyopaque) @import("../sys.zig").DecodeError!Source.Poll {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.polls += 1;
++            return switch (self.polls) {
++                1 => .pending,
++                2 => .{ .frame = .{ .data = try alloc.dupe(u8, &.{ 0, 0, 255, 255 }), .gap_ms = 10 } },
++                else => .done,
++            };
++        }
++        fn destroy(_: Allocator, raw: *anyopaque) void {
++            const self: *@This() = @ptrCast(@alignCast(raw));
++            self.frees += 1;
++        }
++    };
++    var context: Context = .{};
++    var img: image.Image = .{ .width = 1, .height = 1, .format = .rgba, .animation = .run, .next_frame_ms = 10 };
++    defer img.deinit(testing.allocator);
++    try img.frames.append(testing.allocator, .{ .data = try testing.allocator.dupe(u8, &.{ 255, 0, 0, 255 }), .gap_ms = 10 });
++    img.selectFrame(0);
++    img.source = .{ .context = &context, .retained_bytes = 8, .next = Context.next, .destroy = Context.destroy };
++    var storage: Storage = .{ .total_limit = 64, .total_bytes = img.byteSize() };
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expectEqual(@as(usize, 12), storage.total_bytes);
++    try testing.expect(tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expectEqual(@as(usize, 16), storage.total_bytes);
++    try testing.expectEqual(@as(usize, 1), img.current_frame);
++    try testing.expect(tickImage(testing.io, testing.allocator, &storage, &img, 20));
++    try testing.expectEqual(@as(usize, 8), storage.total_bytes);
++    try testing.expectEqual(@as(usize, 1), context.frees);
++    try testing.expect(img.source == null);
++}
++
++test "deferred animation with one frame stops after decoder completion" {
++    const testing = std.testing;
++    const Source = @import("../sys.zig").Animation.Source;
++    const Context = struct {
++        fn next(_: Allocator, _: *anyopaque) @import("../sys.zig").DecodeError!Source.Poll {
++            return .done;
++        }
++        fn destroy(_: Allocator, _: *anyopaque) void {}
++    };
++    var context: u8 = 0;
++    var img: image.Image = .{ .width = 1, .height = 1, .format = .rgba, .animation = .run, .next_frame_ms = 10 };
++    defer img.deinit(testing.allocator);
++    try img.frames.append(testing.allocator, .{ .data = try testing.allocator.dupe(u8, &.{ 255, 0, 0, 255 }), .gap_ms = 10 });
++    img.selectFrame(0);
++    img.source = .{ .context = &context, .retained_bytes = 8, .next = Context.next, .destroy = Context.destroy };
++    var storage: Storage = .{ .total_limit = 64, .total_bytes = img.byteSize() };
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 10));
++    try testing.expect(!tickImage(testing.io, testing.allocator, &storage, &img, 1000));
++    try testing.expectEqual(@as(usize, 4), storage.total_bytes);
++    try testing.expect(img.animation == .stop);
++}
