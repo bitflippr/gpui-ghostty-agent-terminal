@@ -26,6 +26,19 @@ pub(crate) struct Downloads {
 
 #[cfg(feature = "gui")]
 impl Downloads {
+    #[cfg(test)]
+    pub(crate) fn with_pending_completion(
+        completion: std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>,
+    ) -> Self {
+        Self {
+            statuses: vec![DownloadStatus {
+                name: "test-download".into(),
+                result: None,
+            }],
+            pending: vec![(0, completion)],
+        }
+    }
+
     pub fn submit(&mut self, download: Download) {
         type Job = (
             Download,

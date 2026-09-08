@@ -413,7 +413,7 @@ impl TerminalSession {
     fn drain_output(&mut self) -> Result<bool, String> {
         let mut changed = self.terminal.tick_images_now()? | self.downloads.poll();
         if !self.flush_pending_response()? {
-            return Ok(false);
+            return Ok(changed);
         }
         loop {
             let message = self
@@ -948,6 +948,52 @@ mod tests {
                 .as_slice(),
             b"\x1b[?62;22c"
         );
+    }
+
+    #[test]
+    fn completed_download_notifies_renderer_while_process_input_is_backpressured() {
+        let size = TerminalSize::default();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let backpressured = Arc::new(Mutex::new(true));
+        let (output_tx, output_rx) = flume::unbounded();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let mut session = TerminalSession {
+            terminal: ghostty::Terminal::new(size.cols, size.rows).expect("create terminal"),
+            process: Box::new(BackpressuredTransport {
+                bytes: Arc::clone(&bytes),
+                output: output_tx,
+                backpressured,
+            }),
+            output: Some(output_rx),
+            size,
+            pending_response: b"\x1b[?62;22c".to_vec(),
+            downloads: crate::terminal_download::Downloads::with_pending_completion(completed_rx),
+        };
+        assert!(
+            !session
+                .drain_pending_output()
+                .expect("poll pending download")
+        );
+        let saved_path = std::path::PathBuf::from("test-download");
+        completed_tx
+            .send(Ok(saved_path.clone()))
+            .expect("finish download");
+        assert!(session.drain_pending_output().expect("publish completion"));
+        assert_eq!(
+            session
+                .render_update(false)
+                .expect("render download")
+                .downloads[0]
+                .result,
+            Some(Ok(saved_path))
+        );
+        assert!(
+            !session
+                .drain_pending_output()
+                .expect("completion consumed once")
+        );
+        assert!(!session.pending_response.is_empty());
+        assert!(bytes.lock().expect("recorded input").is_empty());
     }
 
     #[test]
