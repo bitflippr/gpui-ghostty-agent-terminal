@@ -926,11 +926,12 @@ impl MultiplexerView {
             .copied();
         let (pointer_x, pointer_y, viewport_width, viewport_height) =
             bounds.map_or((0.0, 0.0, 1, 1), |bounds| {
-                let width = f32::from(bounds.size.width).max(1.0);
-                let height = f32::from(bounds.size.height).max(1.0);
+                let scale = self.terminal_font.cells.scale_factor();
+                let width = (f32::from(bounds.size.width) * scale).max(1.0);
+                let height = (f32::from(bounds.size.height) * scale).max(1.0);
                 (
-                    f32::from(event.position.x - bounds.left()).clamp(0.0, width - 1.0),
-                    f32::from(event.position.y - bounds.top()).clamp(0.0, height - 1.0),
+                    (f32::from(event.position.x - bounds.left()) * scale).clamp(0.0, width - 1.0),
+                    (f32::from(event.position.y - bounds.top()) * scale).clamp(0.0, height - 1.0),
                     width.ceil() as u32,
                     height.ceil() as u32,
                 )
@@ -948,8 +949,8 @@ impl MultiplexerView {
             pointer_y,
             viewport_width,
             viewport_height,
-            cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
-            cell_height: self.terminal_font.cells.height_px().round().max(1.0) as u32,
+            cell_width: u32::from(self.terminal_font.cells.device_width_px()),
+            cell_height: u32::from(self.terminal_font.cells.device_height_px()),
             modifiers,
         };
         coalesce_scroll_input(
@@ -1532,12 +1533,13 @@ impl MultiplexerView {
                 click_count: click_count.min(usize::from(u8::MAX)) as u8,
                 x: point.x,
                 y: point.y,
-                pointer_x,
-                pointer_y,
+                pointer_x: pointer_x * self.terminal_font.cells.scale_factor(),
+                pointer_y: pointer_y * self.terminal_font.cells.scale_factor(),
                 columns: u32::from(snapshot.cols),
-                cell_width: self.terminal_font.cells.width_px().round().max(1.0) as u32,
+                cell_width: u32::from(self.terminal_font.cells.device_width_px()),
                 padding_left: 0,
-                screen_height: screen_height.ceil() as u32,
+                screen_height: (screen_height * self.terminal_font.cells.scale_factor()).ceil()
+                    as u32,
             },
             autoscroll,
         ))
@@ -2006,7 +2008,7 @@ impl MultiplexerView {
         }
     }
 
-    fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>, scale_factor: f32) {
+    fn resize_visible_terminals(&mut self, viewport: gpui::Size<Pixels>) {
         let Some(layout) = self.selected_tab().map(|tab| tab.layout.clone()) else {
             return;
         };
@@ -2036,13 +2038,7 @@ impl MultiplexerView {
         for (terminal_session_id, width, height) in panes {
             let dimensions =
                 GridDimensions::fit(width, height, TERMINAL_PADDING_PX, self.terminal_font.cells);
-            let mut size = self.terminal_font.cells.terminal_size(dimensions);
-            size.cell_width_px = (f32::from(size.cell_width_px) * scale_factor)
-                .round()
-                .clamp(1., f32::from(u16::MAX)) as u16;
-            size.cell_height_px = (f32::from(size.cell_height_px) * scale_factor)
-                .round()
-                .clamp(1., f32::from(u16::MAX)) as u16;
+            let size = self.terminal_font.cells.terminal_size(dimensions);
             if self.requested_sizes.get(&terminal_session_id) != Some(&size) {
                 match self.driver.resize_terminal(terminal_session_id, size) {
                     Ok(()) => {
@@ -4245,6 +4241,16 @@ fn accept_terminal_snapshot(
 
 impl Render for MultiplexerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cells = self.terminal_font.cells.at_scale(window.scale_factor());
+        if cells != self.terminal_font.cells {
+            self.terminal_font.primary_baseline_px +=
+                (cells.height_px() - self.terminal_font.cells.height_px()) / 2.;
+            self.terminal_font.cells = cells;
+            for (_, cache) in self.terminal_render_cache.drain() {
+                self.retired_terminal_images
+                    .extend(cache.images.iter().map(|(_, image)| image.clone()));
+            }
+        }
         let mut released = HashSet::new();
         for image in self.retired_terminal_images.drain(..) {
             if released.insert(Arc::as_ptr(&image)) {
@@ -4252,7 +4258,7 @@ impl Render for MultiplexerView {
             }
         }
         if !self.settings_open {
-            self.resize_visible_terminals(window.viewport_size(), window.scale_factor());
+            self.resize_visible_terminals(window.viewport_size());
         }
         let terminal_selection_pointer_listener =
             Self::render_terminal_selection_pointer_listener(cx);

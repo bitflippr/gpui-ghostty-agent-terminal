@@ -1,25 +1,68 @@
 use crate::{ghostty::SNAPSHOT_CELL_CAPACITY, terminal_session::TerminalSize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
-    width_px: u16,
-    height_px: u16,
+    measured_width_px: u16,
+    measured_height_px: u16,
+    width_px: f32,
+    height_px: f32,
+    scale_factor: f32,
+    device_width_px: u16,
+    device_height_px: u16,
 }
 
 impl CellMetrics {
     pub const fn new(width_px: u16, height_px: u16) -> Self {
         Self {
-            width_px,
-            height_px,
+            measured_width_px: width_px,
+            measured_height_px: height_px,
+            width_px: width_px as f32,
+            height_px: height_px as f32,
+            scale_factor: 1.,
+            device_width_px: width_px,
+            device_height_px: height_px,
         }
     }
 
+    /// Snap the shared text/image grid to whole device pixels. Always start
+    /// from measured metrics so moving between monitors cannot accumulate rounding.
+    pub fn at_scale(self, scale_factor: f32) -> Self {
+        let scale_factor = if scale_factor.is_finite() && scale_factor > 0. {
+            scale_factor
+        } else {
+            1.
+        };
+        let device_width_px = measured_cell_width(f32::from(self.measured_width_px) * scale_factor);
+        let device_height_px =
+            measured_cell_width(f32::from(self.measured_height_px) * scale_factor);
+        Self {
+            width_px: f32::from(device_width_px) / scale_factor,
+            height_px: f32::from(device_height_px) / scale_factor,
+            scale_factor,
+            device_width_px,
+            device_height_px,
+            ..self
+        }
+    }
+
+    pub fn scale_factor(self) -> f32 {
+        self.scale_factor
+    }
+
+    pub fn device_width_px(self) -> u16 {
+        self.device_width_px
+    }
+
+    pub fn device_height_px(self) -> u16 {
+        self.device_height_px
+    }
+
     pub fn width_px(self) -> f32 {
-        f32::from(self.width_px)
+        self.width_px
     }
 
     pub fn height_px(self) -> f32 {
-        f32::from(self.height_px)
+        self.height_px
     }
 
     #[cfg(test)]
@@ -31,8 +74,8 @@ impl CellMetrics {
         TerminalSize::new(
             dimensions.cols,
             dimensions.rows,
-            self.width_px,
-            self.height_px,
+            self.device_width_px,
+            self.device_height_px,
         )
     }
 }
@@ -133,6 +176,49 @@ mod tests {
         font_points_to_pixels, font_points_to_pixels_at_dpi, measured_cell_height,
         measured_cell_width,
     };
+
+    #[test]
+    fn fractional_scale_keeps_text_images_and_pointer_cells_aligned() {
+        let measured = CellMetrics::new(9, 19);
+        for scale in [1., 1.25, 1.5, 1.75, 2.] {
+            let cells = measured.at_scale(scale);
+            let size = cells.terminal_size(GridDimensions {
+                cols: 100,
+                rows: 30,
+            });
+            let image_width = 100. * f32::from(size.cell_width_px) / scale;
+            let image_height = 30. * f32::from(size.cell_height_px) / scale;
+            assert!((cells.grid_width_px(100) - image_width).abs() < 0.001);
+            assert!((cells.height_px() * 30. - image_height).abs() < 0.001);
+            let wide_glyph_end = fixed_cell_glyph_x(100, cells.width_px(), 0., 0.);
+            assert!((wide_glyph_end - image_width).abs() < 0.001);
+            let pointer_x = cells.width_px() * 99.5 * cells.scale_factor();
+            assert_eq!(
+                (pointer_x / f32::from(cells.device_width_px())).floor() as u16,
+                99
+            );
+            let dimensions =
+                GridDimensions::fit(image_width + 0.01, image_height + 0.01, 0., cells);
+            assert_eq!(
+                dimensions,
+                GridDimensions {
+                    cols: 100,
+                    rows: 30
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn changing_monitor_scale_does_not_accumulate_cell_rounding() {
+        let measured = CellMetrics::new(9, 19);
+        let mut cells = measured;
+        for scale in [1.25, 1.5, 1.75, 2., 1.25, 1.] {
+            cells = cells.at_scale(scale);
+            assert_eq!(cells, measured.at_scale(scale));
+        }
+        assert_eq!(cells, measured);
+    }
 
     #[test]
     fn grid_dimensions_fit_whole_cells_inside_the_viewport() {
