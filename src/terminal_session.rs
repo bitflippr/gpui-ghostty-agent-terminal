@@ -1494,14 +1494,15 @@ mod tests {
                     {
                         completed_ms = Some(launched.elapsed().as_secs_f64() * 1000.0);
                     }
-                    if completed_ms.is_some() && (!variant.expect_image || first_image_ms.is_some())
+                    if let Some(completed_ms) = completed_ms
+                        && (!variant.expect_image || first_image_ms.is_some())
                     {
                         eprintln!(
                             "IMAGE_BENCH {}",
                             serde_json::json!({
                                 "round": round + 1, "label": variant.label,
                                 "shell_ready_ms": ready_ms, "first_image_ms": first_image_ms,
-                                "completed_ms": completed_ms.unwrap(),
+                                "completed_ms": completed_ms,
                             })
                         );
                         break;

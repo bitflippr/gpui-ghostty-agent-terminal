@@ -558,7 +558,9 @@ unsafe extern "C" fn collect(context: *mut c_void, raw: *const RawImage) {
                     Arc::from(source)
                 } else {
                     source
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .flat_map(|p| [p[0], p[1], p[2], 255])
                         .collect::<Vec<_>>()
                         .into()
