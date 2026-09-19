@@ -80,13 +80,17 @@ fn prepare_ghostty(root: &Path, upstream: &Path) -> PathBuf {
         upstream.join("build.zig").is_file(),
         "missing Ghostty submodule; run git submodule update --init"
     );
-    let patch = root.join("vendor/ghostty-patches/terminal-images.patch");
-    let bytes = fs::read(&patch).expect("read terminal image extension patch");
+    let committed_patch = root.join("vendor/ghostty-patches/terminal-images.patch");
+    let bytes = normalize_patch_line_endings(
+        fs::read(&committed_patch).expect("read terminal image extension patch"),
+    );
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     GHOSTTY_REVISION.hash(&mut hash);
     bytes.hash(&mut hash);
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let source = out.join(format!("ghostty-source-{:016x}", hash.finish()));
+    let patch = out.join("terminal-images.patch");
+    fs::write(&patch, &bytes).expect("write normalized terminal image extension patch");
     let ready = source.join(".agent-terminal-patched");
     if ready.is_file() {
         return source;
@@ -121,6 +125,25 @@ fn prepare_ghostty(root: &Path, upstream: &Path) -> PathBuf {
     assert!(status.success(), "apply terminal image extension: {status}");
     fs::write(ready, GHOSTTY_REVISION).expect("mark prepared Ghostty source");
     source
+}
+
+/// A checkout with `core.autocrlf=true` that predates the `*.patch -text`
+/// attribute rewrites the text-only patch with CRLF endings, which `git apply`
+/// rejects against the LF upstream sources. The patch carries no binary hunks,
+/// so restoring LF is lossless.
+fn normalize_patch_line_endings(bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.windows(2).any(|pair| pair == b"\r\n") {
+        return bytes;
+    }
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes.iter().peekable();
+    while let Some(&byte) = remaining.next() {
+        if byte == b'\r' && remaining.peek() == Some(&&b'\n') {
+            continue;
+        }
+        normalized.push(byte);
+    }
+    normalized
 }
 
 fn build_ghostty(ghostty: &Path, target: &str) -> PathBuf {

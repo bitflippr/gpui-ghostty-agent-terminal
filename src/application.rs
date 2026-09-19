@@ -19,7 +19,7 @@ enum ApplicationAction {
 
 struct ApplicationRuntime {
     core: ApplicationCore,
-    _presence: Option<DesktopPresence>,
+    presence: Option<DesktopPresence>,
     _intent_task: Task<()>,
 }
 
@@ -93,7 +93,7 @@ fn install_desktop_presence(
     });
     cx.set_global(ApplicationRuntime {
         core,
-        _presence: presence,
+        presence,
         _intent_task: intent_task,
     });
     Ok(())
@@ -103,7 +103,14 @@ pub(crate) fn handle_intent(intent: ApplicationIntent, cx: &mut App) {
     let core = cx.global::<ApplicationRuntime>().core.clone();
     match action_for(intent, !cx.windows().is_empty()) {
         ApplicationAction::OpenWindow => {
-            gui::open_terminal_window(cx, core).expect("open GPUI terminal window");
+            if let Err(error) = gui::open_terminal_window(cx, core) {
+                eprintln!("Could not open terminal window: {error}");
+                // A failed reopen must not take existing Terminal Sessions down.
+                // Without desktop presence there is no way to retry or quit.
+                if cx.global::<ApplicationRuntime>().presence.is_none() && cx.windows().is_empty() {
+                    cx.quit();
+                }
+            }
         }
         ApplicationAction::FocusWindow => {
             let window = cx

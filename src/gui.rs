@@ -22,9 +22,9 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
     Decorations, DispatchPhase, FocusHandle, Font, FontFallbacks, FontId, IntoElement,
     KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, PromptButton, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    SharedString, Task, TextRun, TouchPhase, Transformation, Window, WindowControlArea, canvas,
-    div, ease_out_quint, fill, font, linear_color_stop, linear_gradient, percentage, point,
+    Point, PromptButton, PromptLevel, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    ShapedLine, SharedString, Task, TextRun, TouchPhase, Transformation, Window, WindowControlArea,
+    canvas, div, ease_out_quint, fill, font, linear_color_stop, linear_gradient, percentage, point,
     prelude::*, px, relative, rgb, size, svg,
 };
 use std::collections::{HashMap, HashSet};
@@ -107,6 +107,9 @@ pub(crate) fn open_terminal_window(
                 selections_after_commands: HashMap::new(),
                 sidebar_width: WorkspaceShell::SIDEBAR_WIDTH,
                 sidebar_dragging: false,
+                sidebar_scroll: ScrollHandle::new(),
+                tab_scroll: ScrollHandle::new(),
+                revealed_selection: UiSelection::default(),
                 split_geometries: HashMap::new(),
                 split_dragging: None,
                 preview_split_ratios: HashMap::new(),
@@ -161,6 +164,9 @@ struct MultiplexerView {
     selections_after_commands: HashMap<u64, PaneId>,
     sidebar_width: f32,
     sidebar_dragging: bool,
+    sidebar_scroll: ScrollHandle,
+    tab_scroll: ScrollHandle,
+    revealed_selection: UiSelection,
     split_geometries: HashMap<SplitId, SplitGeometry>,
     split_dragging: Option<SplitId>,
     preview_split_ratios: HashMap<SplitId, SplitRatio>,
@@ -789,14 +795,7 @@ impl MultiplexerView {
                 command_id,
                 outcome,
             } => {
-                if let Some(split_id) = self.pending_split_resizes.remove(&command_id)
-                    && !self
-                        .pending_split_resizes
-                        .values()
-                        .any(|pending| *pending == split_id)
-                {
-                    self.preview_split_ratios.remove(&split_id);
-                }
+                self.finish_pending_split_resize(command_id);
                 self.selection = self
                     .selections_after_commands
                     .remove(&command_id)
@@ -808,14 +807,7 @@ impl MultiplexerView {
             }
             DriverUpdate::CommandRejected { command_id, error } => {
                 self.selections_after_commands.remove(&command_id);
-                if let Some(split_id) = self.pending_split_resizes.remove(&command_id)
-                    && !self
-                        .pending_split_resizes
-                        .values()
-                        .any(|pending| *pending == split_id)
-                {
-                    self.preview_split_ratios.remove(&split_id);
-                }
+                self.finish_pending_split_resize(command_id);
                 self.global_error = Some(error);
             }
             DriverUpdate::Terminal {
@@ -873,6 +865,32 @@ impl MultiplexerView {
                     .extend(cache.images.iter().map(|(_, image)| image.clone()));
                 false
             });
+        let mut panes = Vec::new();
+        for tab in self.hierarchy.spaces.iter().flat_map(|space| &space.tabs) {
+            collect_pane_terminals(&tab.layout, &mut panes);
+        }
+        let pane_ids: HashSet<_> = panes.into_iter().map(|(pane, _)| pane).collect();
+        self.terminal_bounds
+            .lock()
+            .expect("terminal bounds mutex poisoned")
+            .retain(|pane, _| pane_ids.contains(pane));
+        if self
+            .terminal_selection_drag
+            .is_some_and(|drag| !pane_ids.contains(&drag.pane_id))
+        {
+            self.terminal_selection_drag = None;
+        }
+    }
+
+    fn finish_pending_split_resize(&mut self, command_id: u64) {
+        if let Some(split_id) = self.pending_split_resizes.remove(&command_id)
+            && !self
+                .pending_split_resizes
+                .values()
+                .any(|pending| *pending == split_id)
+        {
+            self.preview_split_ratios.remove(&split_id);
+        }
     }
 
     fn on_terminal_scroll(
@@ -1164,13 +1182,6 @@ impl MultiplexerView {
         cx: &mut Context<Self>,
     ) {
         use KeybindAction::*;
-        let direction = match action {
-            FocusLeft | ResizeLeft => Some(Direction::Left),
-            FocusRight | ResizeRight => Some(Direction::Right),
-            FocusUp | ResizeUp => Some(Direction::Up),
-            FocusDown | ResizeDown => Some(Direction::Down),
-            _ => None,
-        };
         match action {
             OpenSettings => self.toggle_settings(window, cx),
             CreateSpace => self.create_space(cx),
@@ -1214,22 +1225,14 @@ impl MultiplexerView {
                     self.focus_pane(id, window, cx);
                 }
             }
-            FocusLeft | FocusRight | FocusUp | FocusDown => {
-                let ids = self.visible_panes();
-                let target = self.selection.pane_id.and_then(|id| {
-                    let bounds = self
-                        .terminal_bounds
-                        .lock()
-                        .expect("terminal bounds mutex poisoned");
-                    adjacent_pane(id, &ids, &bounds, direction.unwrap())
-                });
-                if let Some(id) = target {
-                    self.focus_pane(id, window, cx);
-                }
-            }
-            ResizeLeft | ResizeRight | ResizeUp | ResizeDown => {
-                self.resize_split_keyboard(direction.unwrap(), cx)
-            }
+            FocusLeft => self.focus_adjacent_pane(Direction::Left, window, cx),
+            FocusRight => self.focus_adjacent_pane(Direction::Right, window, cx),
+            FocusUp => self.focus_adjacent_pane(Direction::Up, window, cx),
+            FocusDown => self.focus_adjacent_pane(Direction::Down, window, cx),
+            ResizeLeft => self.resize_split_keyboard(Direction::Left, cx),
+            ResizeRight => self.resize_split_keyboard(Direction::Right, cx),
+            ResizeUp => self.resize_split_keyboard(Direction::Up, cx),
+            ResizeDown => self.resize_split_keyboard(Direction::Down, cx),
             ToggleSidebar => self.toggle_sidebar(cx),
             IncreaseFont | DecreaseFont | ResetFont => {
                 let size = if action == ResetFont {
@@ -1301,13 +1304,13 @@ impl MultiplexerView {
                         ) {
                             self.select_space(id, window, cx);
                         }
-                    } else if let Some(space) = self.selected_space() {
-                        if let Some(id) = numbered_item(
+                    } else if let Some(space) = self.selected_space()
+                        && let Some(id) = numbered_item(
                             &space.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
                             index,
-                        ) {
-                            self.select_tab(id, window, cx);
-                        }
+                        )
+                    {
+                        self.select_tab(id, window, cx);
                     }
                 }
             }
@@ -1320,6 +1323,25 @@ impl MultiplexerView {
             collect_pane_terminals(&tab.layout, &mut panes);
         }
         panes.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn focus_adjacent_pane(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.visible_panes();
+        let target = self.selection.pane_id.and_then(|id| {
+            let bounds = self
+                .terminal_bounds
+                .lock()
+                .expect("terminal bounds mutex poisoned");
+            adjacent_pane(id, &ids, &bounds, direction)
+        });
+        if let Some(id) = target {
+            self.focus_pane(id, window, cx);
+        }
     }
 
     fn all_panes(&self) -> Vec<(PaneId, TerminalSessionId, String)> {
@@ -1808,6 +1830,30 @@ impl MultiplexerView {
         cx.notify();
     }
 
+    fn reveal_selected_resources(&mut self) {
+        // Reveal on navigation, not on terminal redraws, so manual scrolling stays put.
+        if self.revealed_selection.space_id != self.selection.space_id
+            && let Some(index) = self
+                .hierarchy
+                .spaces
+                .iter()
+                .position(|space| Some(space.id) == self.selection.space_id)
+        {
+            self.sidebar_scroll.scroll_to_item(index);
+        }
+        if self.revealed_selection.tab_id != self.selection.tab_id
+            && let Some(index) = self.selected_space().and_then(|space| {
+                space
+                    .tabs
+                    .iter()
+                    .position(|tab| Some(tab.id) == self.selection.tab_id)
+            })
+        {
+            self.tab_scroll.scroll_to_item(index);
+        }
+        self.revealed_selection = self.selection;
+    }
+
     fn select_tab(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor_blink.reset(Instant::now());
         self.clear_terminal_selection();
@@ -2096,15 +2142,12 @@ impl MultiplexerView {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut sidebar = div()
+            .id("space-list")
             .flex()
             .flex_col()
-            .relative()
-            .w(px(self.sidebar_width))
-            .h_full()
-            .flex_none()
-            .bg(self.shell.opaque_color(ShellColor::Sidebar))
-            .border_r_1()
-            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
             .px_1()
             .pt_2()
             .gap(px(2.));
@@ -2163,6 +2206,7 @@ impl MultiplexerView {
                 sidebar.child(
                     div()
                         .id(("space", space_id.as_u64()))
+                        .flex_none()
                         .group(hover_group.clone())
                         .relative()
                         .cursor_pointer()
@@ -2255,7 +2299,15 @@ impl MultiplexerView {
                         .child(close_button),
                 );
         }
-        sidebar
+        div()
+            .relative()
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .bg(self.shell.opaque_color(ShellColor::Sidebar))
+            .border_r_1()
+            .border_color(self.shell.opaque_color(ShellColor::Border))
+            .child(sidebar)
             .child(
                 div()
                     .id("sidebar-resize")
@@ -2310,10 +2362,11 @@ impl MultiplexerView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let transitioning = transition.is_some();
-        let visible_count = summary.visible.len();
+        let count = summary.entries.len();
+        let visible_count = count.min(3);
         let mut icons = div().flex().items_center().h(px(26.));
         if !expanded {
-            for (index, entry) in summary.visible.iter().enumerate() {
+            for (index, entry) in summary.entries.iter().take(3).enumerate() {
                 icons = icons.child(
                     div()
                         .flex()
@@ -2324,13 +2377,9 @@ impl MultiplexerView {
                 );
             }
         }
-        let noun = if summary.count == 1 {
-            "agent"
-        } else {
-            "agents"
-        };
+        let noun = if count == 1 { "agent" } else { "agents" };
         let count_label = transitioning_agent_count_label(
-            format!("{} {noun}", summary.count),
+            format!("{count} {noun}"),
             space_id,
             visible_count,
             expanded,
@@ -2374,7 +2423,7 @@ impl MultiplexerView {
         let mut section = div().flex().flex_col().child(toggle);
         if expanded {
             let mut rows = div().flex().flex_col().flex_none().mt(px(3.)).gap(px(2.));
-            for (index, entry) in summary.visible.into_iter().enumerate() {
+            for (index, entry) in summary.entries.into_iter().enumerate() {
                 let tab_id = entry.tab_id;
                 let pane_id = entry.pane_id;
                 let active = self.selection.space_id == Some(space_id)
@@ -2458,7 +2507,7 @@ impl MultiplexerView {
             }
             section = section.child(rows);
         }
-        transitioning_agent_section(section, space_id, visible_count, expanded, transition)
+        transitioning_agent_section(section, space_id, count, expanded, transition)
     }
 
     fn render_compact_terminal_summary(&self, title: String, additional_tabs: usize) -> AnyElement {
@@ -2749,13 +2798,15 @@ impl MultiplexerView {
             });
 
         let mut tabs = div()
+            .id("tab-list")
             .flex()
             .items_center()
             .gap(px(4.))
             .h_full()
             .flex_shrink(1.)
             .min_w_0()
-            .overflow_hidden()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
             .pl_2();
         if let Some(space) = self.selected_space() {
             for tab in &space.tabs {
@@ -2796,6 +2847,7 @@ impl MultiplexerView {
                 tabs = tabs.child(
                     div()
                         .id(("tab", tab_id.as_u64()))
+                        .flex_none()
                         .group(hover_group.clone())
                         .relative()
                         .cursor_pointer()
@@ -2803,6 +2855,7 @@ impl MultiplexerView {
                         .items_center()
                         .h(px(WorkspaceShell::TAB_HEIGHT))
                         .max_w(px(180.))
+                        .min_w(px(90.))
                         .px_2()
                         .rounded_lg()
                         .border_1()
@@ -2878,10 +2931,6 @@ impl MultiplexerView {
                         .child(close_button),
                 );
             }
-            tabs = tabs.child(
-                self.chrome_tile("create-tab", ShellIcon::Plus, false, false)
-                    .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx))),
-            );
         }
 
         let pane_controls = div()
@@ -2930,6 +2979,12 @@ impl MultiplexerView {
             .bg(self.selected_terminal_background())
             .child(sidebar_chrome)
             .child(tabs)
+            .when(self.selected_space().is_some(), |this| {
+                this.child(
+                    self.chrome_tile("create-tab", ShellIcon::Plus, false, false)
+                        .on_click(cx.listener(|view, _event, _window, cx| view.create_tab(cx))),
+                )
+            })
             .child(self.render_titlebar_drag_region("main-titlebar-drag-region", cx))
             .child(pane_controls)
             .children(self.render_window_controls(window))
@@ -4258,6 +4313,11 @@ impl Render for MultiplexerView {
             }
         }
         if !self.settings_open {
+            self.sidebar_width = sidebar_width_for_viewport(
+                self.sidebar_width,
+                window.viewport_size().width.as_f32(),
+            );
+            self.reveal_selected_resources();
             self.resize_visible_terminals(window.viewport_size());
         }
         let terminal_selection_pointer_listener =
@@ -4268,15 +4328,10 @@ impl Render for MultiplexerView {
             .on_key_down(cx.listener(|view, event, window, cx| view.on_key_down(event, window, cx)))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
                 if view.sidebar_dragging {
-                    let viewport = window.viewport_size().width.as_f32();
-                    let max_width = (viewport - 500.)
-                        .max(WorkspaceShell::SIDEBAR_MIN_WIDTH)
-                        .min(viewport * 0.5);
-                    view.sidebar_width = event
-                        .position
-                        .x
-                        .as_f32()
-                        .clamp(WorkspaceShell::SIDEBAR_MIN_WIDTH, max_width);
+                    view.sidebar_width = sidebar_width_for_viewport(
+                        event.position.x.as_f32(),
+                        window.viewport_size().width.as_f32(),
+                    );
                     cx.notify();
                 }
                 view.update_split_drag(event.position, cx);
@@ -4335,23 +4390,63 @@ impl Render for MultiplexerView {
                     .into_any_element()
             })
             .when(self.move_source.is_some() && !self.settings_open, |this| {
-                let target = self.all_panes().into_iter().find(|(id, _, _)| Some(*id) == self.move_target).map(|(_, _, label)| label).unwrap_or_else(|| "No destination Pane available".into());
-                this.child(div().absolute().top(px(70.)).left(px(24.)).right(px(24.)).p_4().rounded_lg()
-                    .bg(self.shell.opaque_color(ShellColor::Selected)).text_color(self.shell.color(ShellColor::Text))
-                    .child(format!("Move Pane to: {target} | Arrows/Tab: choose | Enter: move right of destination | Esc: cancel")))
+                let target = self
+                    .all_panes()
+                    .into_iter()
+                    .find(|(id, _, _)| Some(*id) == self.move_target)
+                    .map(|(_, _, label)| label)
+                    .unwrap_or_else(|| "No destination Pane available".into());
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(70.))
+                        .left(px(24.))
+                        .right(px(24.))
+                        .p_4()
+                        .rounded_lg()
+                        .bg(self.shell.opaque_color(ShellColor::Selected))
+                        .text_color(self.shell.color(ShellColor::Text))
+                        .child(format!("Move Pane to: {target}"))
+                        .child(div().mt_1().text_size(px(12.)).child(
+                            "Arrows/Tab: choose · Enter: move right of destination · Esc: cancel",
+                        )),
+                )
             })
             .when_some(self.global_error.clone(), |this, error| {
                 this.child(
                     div()
                         .absolute()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .left(px(12.))
                         .right(px(12.))
                         .bottom(px(10.))
                         .rounded_lg()
-                        .bg(self.shell.color(ShellColor::DangerHover))
+                        .bg(self.shell.opaque_color(ShellColor::DangerHover))
                         .px_3()
                         .py_2()
                         .text_color(self.shell.color(ShellColor::Danger))
-                        .child(error),
+                        .child(div().flex_1().min_w_0().child(error))
+                        .child(
+                            div()
+                                .id("dismiss-error")
+                                .flex_none()
+                                .size(px(20.))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|this| this.bg(self.shell.control_hover()))
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.global_error = None;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                                .child(self.shell.icon(
+                                    ShellIcon::Close,
+                                    self.shell.color(ShellColor::Danger),
+                                    14.,
+                                )),
+                        ),
                 )
             })
     }
@@ -4363,6 +4458,13 @@ enum Direction {
     Right,
     Up,
     Down,
+}
+
+fn sidebar_width_for_viewport(requested: f32, viewport: f32) -> f32 {
+    let maximum = (viewport - 500.)
+        .min(viewport * 0.5)
+        .max(WorkspaceShell::SIDEBAR_MIN_WIDTH);
+    requested.clamp(WorkspaceShell::SIDEBAR_MIN_WIDTH, maximum)
 }
 impl Direction {
     fn axis(self) -> SplitAxis {
@@ -4912,8 +5014,7 @@ fn collect_terminal_sessions(layout: &PaneLayout, output: &mut Vec<TerminalSessi
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SpaceAgentSummary {
-    count: usize,
-    visible: Vec<SpaceAgentEntry>,
+    entries: Vec<SpaceAgentEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4949,14 +5050,10 @@ fn agent_summary_for_space(
     prioritized_agent_summary(agents)
 }
 
-fn prioritized_agent_summary(agents: Vec<SpaceAgentEntry>) -> Option<SpaceAgentSummary> {
-    let count = agents.len();
-    let mut agents = agents.into_iter().enumerate().collect::<Vec<_>>();
-    agents.sort_by_key(|(position, entry)| (std::cmp::Reverse(entry.agent.priority()), *position));
-    (count > 0).then(|| SpaceAgentSummary {
-        count,
-        visible: agents.into_iter().take(3).map(|(_, entry)| entry).collect(),
-    })
+fn prioritized_agent_summary(mut agents: Vec<SpaceAgentEntry>) -> Option<SpaceAgentSummary> {
+    // Stable sorting preserves Pane order among agents with equal priority.
+    agents.sort_by_key(|entry| std::cmp::Reverse(entry.agent.priority()));
+    (!agents.is_empty()).then_some(SpaceAgentSummary { entries: agents })
 }
 
 fn collect_pane_terminals(layout: &PaneLayout, output: &mut Vec<(PaneId, TerminalSessionId)>) {
@@ -5587,13 +5684,14 @@ mod tests {
     use super::{
         CLAUDE_AGENT_ICON, CloseTarget, FallbackClusterBounds, GEMINI_AGENT_ICON,
         OPENAI_AGENT_ICON, PasteShortcutPlatform, SpaceAgentEntry, SplitGeometry,
-        TERMINAL_PADDING_PX, TerminalGlyphOverflow, UiSelection, accept_terminal_snapshot,
-        agent_icon_data, agent_icon_resting_geometry, agent_icon_transition_geometry, cursor_rects,
-        first_pane_id, fitted_cluster_glyph_position, font_is_terminal_fallback_only,
-        installed_terminal_font_fallbacks_from, layout_symbol_fallback_cluster,
-        normalize_page_scroll_delta, pane_close_shortcut_for, pane_extents,
-        prioritized_agent_summary, projected_split_extent, row_cell_is_followed_by_space,
-        selection_for_created, selection_for_pane, split_ratio_at, terminal_copy_shortcut_for,
+        TERMINAL_PADDING_PX, TerminalGlyphOverflow, UiSelection, WorkspaceShell,
+        accept_terminal_snapshot, agent_icon_data, agent_icon_resting_geometry,
+        agent_icon_transition_geometry, cursor_rects, first_pane_id, fitted_cluster_glyph_position,
+        font_is_terminal_fallback_only, installed_terminal_font_fallbacks_from,
+        layout_symbol_fallback_cluster, normalize_page_scroll_delta, pane_close_shortcut_for,
+        pane_extents, prioritized_agent_summary, projected_split_extent,
+        row_cell_is_followed_by_space, selection_for_created, selection_for_pane,
+        sidebar_width_for_viewport, split_ratio_at, terminal_copy_shortcut_for,
         terminal_font_with_fallbacks, terminal_key_input, terminal_paste_shortcut_for,
         terminal_selection_should_autoscroll, terminal_sessions_for_target,
         windows_caption_font_for_build,
@@ -6136,7 +6234,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_agent_summary_keeps_count_and_shows_top_three_by_priority() {
+    fn agent_summary_preserves_all_agents_in_priority_order() {
         let agent = |id, program, state| SpaceAgentEntry {
             agent: AgentSnapshot { program, state },
             tab_id: TabId::from_u64(id),
@@ -6148,14 +6246,28 @@ mod tests {
             agent(2, AgentProgram::Claude, AgentState::Idle),
             agent(3, AgentProgram::Codex, AgentState::Blocked),
             agent(4, AgentProgram::Gemini, AgentState::Working),
+            agent(5, AgentProgram::Claude, AgentState::Working),
         ])
         .expect("agents produce a summary");
 
-        assert_eq!(summary.count, 4);
-        assert_eq!(summary.visible.len(), 3);
-        assert_eq!(summary.visible[0].agent.state, AgentState::Blocked);
-        assert_eq!(summary.visible[1].agent.state, AgentState::Working);
-        assert_eq!(summary.visible[2].agent.state, AgentState::Idle);
+        assert_eq!(summary.entries.len(), 5);
+        assert_eq!(summary.entries[0].agent.state, AgentState::Blocked);
+        assert_eq!(summary.entries[1].agent.state, AgentState::Working);
+        assert_eq!(summary.entries[1].pane_id, PaneId::from_u64(4));
+        assert_eq!(summary.entries[2].pane_id, PaneId::from_u64(5));
+        assert_eq!(summary.entries[3].agent.state, AgentState::Idle);
+        assert_eq!(summary.entries[4].agent.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn sidebar_width_keeps_terminal_room_after_window_shrinks() {
+        assert_eq!(sidebar_width_for_viewport(800., 720.), 220.);
+        assert_eq!(sidebar_width_for_viewport(220., 1080.), 220.);
+        assert_eq!(sidebar_width_for_viewport(800., 1600.), 800.);
+        assert_eq!(
+            sidebar_width_for_viewport(220., 300.),
+            WorkspaceShell::SIDEBAR_MIN_WIDTH
+        );
     }
 
     #[test]
