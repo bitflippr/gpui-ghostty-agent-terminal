@@ -2,7 +2,7 @@
 
 Research date: 2026-08-19
 
-This report answers [research ticket #6](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/6) using pinned first-party documentation and source repositories.
+This report answers [research ticket #6](https://github.com/bitflippr/gpui-ghostty-agent-terminal/issues/6) using pinned first-party documentation and source repositories.
 
 ## Executive conclusion
 

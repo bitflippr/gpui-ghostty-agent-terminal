@@ -186,7 +186,7 @@ finish() {
 
 TOTAL_STAGES=6
 
-TARGET_REPO="skulldogged/gpui-ghostty-agent-terminal"
+TARGET_REPO="bitflippr/gpui-ghostty-agent-terminal"
 OWNER_LOGIN="skulldogged"
 EXPECTED_TARGET_REPO="$TARGET_REPO"
 EXPECTED_OWNER_LOGIN="$OWNER_LOGIN"

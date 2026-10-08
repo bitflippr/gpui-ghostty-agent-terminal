@@ -86,7 +86,7 @@
 
           meta = {
             description = "Cross-platform GPUI terminal powered by libghostty-vt";
-            homepage = "https://github.com/skulldogged/gpui-ghostty-agent-terminal";
+            homepage = "https://github.com/bitflippr/gpui-ghostty-agent-terminal";
             mainProgram = "agent-terminal";
             platforms = systems;
           };

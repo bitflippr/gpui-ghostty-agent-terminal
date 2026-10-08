@@ -21,7 +21,7 @@ export CODEX_GITHUB_DISABLE_SECRET_SERVICE=1
 
 mkdir -p "$XDG_CONFIG_HOME/codex-github-machine"
 cat > "$XDG_CONFIG_HOME/codex-github-machine/setup.env" <<'CONFIG'
-TARGET_REPO=skulldogged/gpui-ghostty-agent-terminal
+TARGET_REPO=bitflippr/gpui-ghostty-agent-terminal
 AGENT_GITHUB_USER=fixture-agent
 AGENT_GITHUB_TOKEN_FILE=TOKEN_FILE_PLACEHOLDER
 CONFIG

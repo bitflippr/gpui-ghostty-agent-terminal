@@ -2,7 +2,7 @@
 
 Research date: 2026-08-19
 
-This report answers [research ticket #3](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/3). It uses only current first-party documentation, specifications, and source repositories. Source observations are labelled **Fact**; proposed decisions and compatibility judgments are labelled **Inference**.
+This report answers [research ticket #3](https://github.com/bitflippr/gpui-ghostty-agent-terminal/issues/3). It uses only current first-party documentation, specifications, and source repositories. Source observations are labelled **Fact**; proposed decisions and compatibility judgments are labelled **Inference**.
 
 ## Executive conclusion
 

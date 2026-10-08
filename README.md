@@ -4,11 +4,11 @@ Cross-platform graphical terminal-multiplexer foundation built with GPUI and
 the supported `libghostty-vt` C interface.
 
 The cross-platform proof is tracked by
-[#8](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/8).
+[#8](https://github.com/bitflippr/gpui-ghostty-agent-terminal/issues/8).
 The production-oriented Terminal Session seam is tracked by
-[#11](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/11).
+[#11](https://github.com/bitflippr/gpui-ghostty-agent-terminal/issues/11).
 The fixed-cell GPUI renderer is tracked by
-[#12](https://github.com/skulldogged/gpui-ghostty-agent-terminal/issues/12).
+[#12](https://github.com/bitflippr/gpui-ghostty-agent-terminal/issues/12).
 
 ## Terminal Session interface
 

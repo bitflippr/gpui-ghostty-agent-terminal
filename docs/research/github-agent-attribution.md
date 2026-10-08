@@ -6,7 +6,7 @@ Research date: 2026-08-20
 
 The project selected the reusable **machine-user** alternative described below and
 implemented its fail-closed local workflow in
-[PR #23](https://github.com/skulldogged/gpui-ghostty-agent-terminal/pull/23).
+[PR #23](https://github.com/bitflippr/gpui-ghostty-agent-terminal/pull/23).
 Agent-authored GitHub mutations now go through `agent-gh`, while signed commits and
 pushes go through `agent-git`. The private-App option remains the researcher's
 least-privilege recommendation for a repository-specific identity, not the project's
@@ -14,7 +14,7 @@ current setup.
 
 ## Research recommendation
 
-Use a **private GitHub App**, installed only on `skulldogged/gpui-ghostty-agent-terminal`, for this repository's agent-authored GitHub writes. An installation access token attributes issues, pull requests, comments, reviews, and other API mutations to the App, visibly as an App bot rather than as `skulldogged`. Installation tokens last one hour, can be narrowed to selected repositories and permissions, are independent of a human account, and do not consume a GitHub seat. [GitHub App authentication and attribution](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/about-authentication-with-a-github-app), [App versus PAT](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/deciding-when-to-build-a-github-app), [installation-token endpoint](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app)
+Use a **private GitHub App**, installed only on `bitflippr/gpui-ghostty-agent-terminal`, for this repository's agent-authored GitHub writes. An installation access token attributes issues, pull requests, comments, reviews, and other API mutations to the App, visibly as an App bot rather than as `skulldogged`. Installation tokens last one hour, can be narrowed to selected repositories and permissions, are independent of a human account, and do not consume a GitHub seat. [GitHub App authentication and attribution](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/about-authentication-with-a-github-app), [App versus PAT](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/deciding-when-to-build-a-github-app), [installation-token endpoint](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app)
 
 A **machine user** is permitted and would look more literally like a separate GitHub user: it has a normal `@username`, profile, sign-in, and notification inbox. It is reasonable only if that user-like profile or reuse across unrelated owners is more important than least privilege. For this public, personal-account repository it is the weaker default: the account can only be added as a write collaborator, and GitHub's current fine-grained-PAT limitations prevent a repository collaborator from using a fine-grained PAT to contribute. Local automation would therefore need a classic `public_repo` PAT for API/`gh` operations, plus either that PAT or an SSH key for Git. (`repo` would be required for private repositories.) The classic scope remains broader than the three narrow permissions required by the App. [Machine users](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys#machine-users), [fine-grained PAT limitations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-token-limitations), [classic `public_repo` and `repo` scopes](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps#available-scopes), [personal-repository collaborator permissions](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/repository-access-and-collaboration/permission-levels-for-a-personal-account-repository)
 
@@ -73,7 +73,7 @@ The focused policy for this repository should be:
 
 ## Recommended GitHub App permissions
 
-Install the App on **only** `skulldogged/gpui-ghostty-agent-terminal` with:
+Install the App on **only** `bitflippr/gpui-ghostty-agent-terminal` with:
 
 - **Metadata: read**, GitHub's baseline repository metadata permission.
 - **Contents: write** for branch creation, authenticated pushes, and content changes.
